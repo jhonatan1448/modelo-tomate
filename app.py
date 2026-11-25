@@ -12,7 +12,7 @@ st.set_page_config(page_title="Modelo de Fertilización - TOMATE", layout="wide"
 
 CONFIG_FILE = "modelo_tomate_config.json"
 CATALOGO_FILE = "catalogo_fertilizantes.csv"
-DOSIS_FILE = "dosis_etapas.csv"
+DOSIS_FILE = "dosis_semanales.csv"
 
 NUTRIENTES = ["N_NO3", "N_NH4", "P2O5", "K2O", "CaO", "MgO", "S", "Fe", "Mn", "Zn", "B", "Cu", "Mo", "Co"]
 REQ_NUT = ["N_Total", "P2O5", "K2O", "CaO", "MgO", "S", "Fe", "Mn", "Zn", "B", "Cu", "Mo", "Co"]
@@ -147,42 +147,6 @@ CATALOGO_BASE = [
     {'Producto': 'NUTRIFEED INICIO', 'N_NO3': 1.0, 'N_NH4': 11.0, 'P2O5': 30.0, 'K2O': 10.0, 'CaO': 0.0, 'MgO': 0.4, 'S': 8.0, 'Fe': 0.05, 'Mn': 0.08, 'Zn': 0.03, 'B': 0.05, 'Cu': 0.0, 'Mo': 0.0, 'Co': 0.0},
 ]
 
-DOSIS_BASE = {'Etapa 1 - Vegetativo': {'HAIFA - CAL(15-0-0-26)': 100.0,
-                          'MULTI NPK (13-3-43)': 120.0,
-                          'SOLUPOTASSE(0-0-50-18)': 50.0,
-                          'NATURQUEL FE 4,8': 18.0,
-                          'NATURZINC': 1.5,
-                          'NATURMANGANESO': 4.0,
-                          'KLIPBORO': 0.9,
-                          'KELLUS CU': 1.2,
-                          'MOLIB-K': 0.035,
-                          'SULFATO DE MAGNESIO TÉC PQP (0-0-0-16-13)': 106.0,
-                          'VAN IPEREN INICIO 11-32-11 + ME': 140.0,
-                          'PRODUCCION SOLUCIONES NUTRITIVAS': 1.0},
- 'Etapa 2 - Desarrollo': {'MAG BORO': 150.0,
-                          'DKP HAIFA': 100.0,
-                          'SOLUPOTASSE(0-0-50-18)': 150.0,
-                          'NATURQUEL FE 4,8': 25.0,
-                          'NATURZINC': 3.0,
-                          'NATURMANGANESO': 6.0,
-                          'KLIPBORO': 0.5,
-                          'MOLIB-K': 0.05,
-                          'KELLUS CU': 1.8,
-                          'SULFATO DE MAGNESIO TÉC PQP (0-0-0-16-13)': 50.0,
-                          'VAN IPEREN PRODUCCION 12-5-40 + ME': 100.0,
-                          'PRODUCCION SOLUCIONES NUTRITIVAS': 1.0},
- 'Etapa 3 - Llenado': {'MAG BORO': 150.0,
-                       'HAIFA - CAL(15-0-0-26)': 150.0,
-                       'SOLUPOTASSE(0-0-50-18)': 150.0,
-                       'DKP HAIFA': 150.0,
-                       'SULFATO DE MAGNESIO TÉC PQP (0-0-0-16-13)': 120.0,
-                       'NATURQUEL FE 4,8': 35.0,
-                       'NATURZINC': 5.0,
-                       'NATURMANGANESO': 8.0,
-                       'KLIPBORO': 2.5,
-                       'MOLIB-K': 0.1,
-                       'KELLUS CU': 3.0,
-                       'PRODUCCION SOLUCIONES NUTRITIVAS': 1.0}}
 
 
 # ------------------------------------------------------------------
@@ -217,14 +181,20 @@ def cargar_catalogo():
     return df
 
 
+COLS_DOSIS = ["Etapa", "Producto", "Dosis_semana"]
+
+
 def cargar_dosis():
+    # Cada etapa empieza vacía: el usuario elige sus fertilizantes.
     if os.path.exists(DOSIS_FILE):
-        return pd.read_csv(DOSIS_FILE)
-    filas = [{"Etapa": e, "Producto": p, "Dosis_kg_ha": d}
-             for e, prods in DOSIS_BASE.items() for p, d in prods.items()]
-    df = pd.DataFrame(filas)
-    df.to_csv(DOSIS_FILE, index=False)
-    return df
+        df = pd.read_csv(DOSIS_FILE)
+        if all(c in df.columns for c in COLS_DOSIS):
+            return df[COLS_DOSIS]
+    return pd.DataFrame(columns=COLS_DOSIS)
+
+
+def guardar_dosis(df):
+    df[COLS_DOSIS].to_csv(DOSIS_FILE, index=False)
 
 
 # ------------------------------------------------------------------
@@ -256,13 +226,16 @@ def requerimiento_etapa(cfg, req, etapa):
 
 
 def calcular_dosis(df_dosis_etapa, catalogo, d, semanas, ferti_sem):
-    df = df_dosis_etapa.merge(catalogo, on="Producto", how="left").fillna(0.0)
-    df = df[df["Dosis_kg_ha"] > 0].copy()
+    """Dosis_semana = kg/ha (o L/ha) por semana. Los aportes de nutrientes quedan para toda la etapa."""
+    df = df_dosis_etapa[["Producto", "Dosis_semana"]].merge(catalogo, on="Producto", how="left").fillna(0.0)
+    df["Dosis_semana"] = pd.to_numeric(df["Dosis_semana"], errors="coerce").fillna(0.0)
+    df = df[df["Dosis_semana"] > 0].copy()
+    df["Dosis_kg_ha"] = df["Dosis_semana"] * semanas
     for n in NUTRIENTES:
         df[n] = df["Dosis_kg_ha"] * df[n] / 100
-    df["Cantidad_lote_kg"] = df["Dosis_kg_ha"] * d["area_ha"]
-    n_apl = max(semanas * ferti_sem, 1)
-    df["Por_aplicacion_kg"] = df["Cantidad_lote_kg"] / n_apl
+    df["Lote_semana_kg"] = df["Dosis_semana"] * d["area_ha"]
+    df["Por_aplicacion_kg"] = df["Lote_semana_kg"] / max(ferti_sem, 1)
+    df["Cantidad_lote_kg"] = df["Lote_semana_kg"] * semanas
     return df
 
 
@@ -297,11 +270,29 @@ df_dosis = cargar_dosis()
 d = diseno(cfg)
 req = requerimiento_ciclo(cfg, d)
 
+with st.sidebar:
+    st.header("💾 Respaldo de tu programa")
+    st.caption("En Streamlit Cloud los datos se pueden borrar al reiniciarse la app. "
+               "Descarga tu programa y vuelve a cargarlo cuando lo necesites.")
+    st.download_button("📥 Descargar mi fertilización (CSV)", data=df_dosis.to_csv(index=False).encode("utf-8"),
+                       file_name=f"fertilizacion_tomate_{datetime.now():%Y%m%d}.csv", mime="text/csv")
+    subido = st.file_uploader("Cargar fertilización guardada", type="csv")
+    if subido is not None and st.button("♻️ Restaurar este archivo"):
+        df_up = pd.read_csv(subido)
+        if all(c in df_up.columns for c in COLS_DOSIS):
+            guardar_dosis(df_up)
+            for k in [k for k in st.session_state if k.startswith(("dosis_mem_", "sel_"))]:
+                del st.session_state[k]
+            st.success("✅ Fertilización restaurada")
+            st.rerun()
+        else:
+            st.error("El archivo no tiene las columnas Etapa, Producto, Dosis_semana.")
+
 st.title("🍅 Modelo de Fertilización - Cultivo de TOMATE")
 st.write("Diseño agronómico, requerimientos por etapa fenológica, cálculo de dosis con hidrosolubles.")
 
 tab_dis, tab_req, tab_dosis, tab_res, tab_cat = st.tabs([
-    "🌱 Diseño del Cultivo", "📆 Requerimientos por Etapa", "🧪 Dosis por Etapa",
+    "🌱 Diseño del Cultivo", "📆 Requerimientos por Etapa", "🧪 Fertilización Semanal",
     "📋 Resumen del Ciclo", "📚 Catálogo de Fertilizantes"])
 
 # ==========================================
@@ -407,53 +398,73 @@ with tab_req:
                     width="stretch")
 
 # ==========================================
-# PESTAÑA 3: DOSIS POR ETAPA
+# PESTAÑA 3: FERTILIZACIÓN SEMANAL
 # ==========================================
 with tab_dosis:
-    st.header("Cálculo de fórmula de fertilización con hidrosolubles")
+    st.header("Arma tu fertilización semanal")
     etapa = st.radio("Etapa", ETAPAS, horizontal=True, key="etapa_sel")
     info = cfg["etapas"][etapa]
+    sem, fxs = max(int(info["semanas"]), 1), max(int(info["ferti_semana"]), 1)
     sol = requerimiento_etapa(cfg, req, etapa)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Duración", f"{info['semanas']} semanas")
-    c2.metric("Fertilizaciones / semana", info["ferti_semana"])
-    c3.metric("Total aplicaciones", info["semanas"] * info["ferti_semana"])
-    c4.metric("Área del lote", f"{d['area_ha']:.3f} ha")
+    c1.metric("Duración", f"{sem} semanas")
+    c2.metric("Fertilizaciones / semana", fxs)
+    c3.metric("Área del lote", f"{d['area_ha']:.3f} ha")
+    c4.metric("Plantas", f"{cfg['plantas_sembradas']:,}")
 
-    st.subheader("Productos y dosis (kg/ha-etapa)")
-    st.caption("Agrega filas con ➕, elige el producto de la lista y escribe la dosis. Para borrar, selecciona la fila y usa 🗑️.")
-    df_et = df_dosis[df_dosis["Etapa"] == etapa][["Producto", "Dosis_kg_ha"]].reset_index(drop=True)
-    df_et_ed = st.data_editor(
-        df_et, num_rows="dynamic", width="stretch", key=f"ed_dosis_{etapa}",
+    # Dosis en memoria por etapa (para no perder lo escrito al agregar productos)
+    ss_key = f"dosis_mem_{etapa}"
+    if ss_key not in st.session_state:
+        guardadas = df_dosis[df_dosis["Etapa"] == etapa]
+        st.session_state[ss_key] = dict(zip(guardadas["Producto"], guardadas["Dosis_semana"].astype(float)))
+    memoria = st.session_state[ss_key]
+
+    st.subheader("1. Elige tus fertilizantes")
+    elegidos = st.multiselect("Fertilizantes para esta etapa (escribe para buscar)",
+                              options=sorted(catalogo["Producto"].tolist()),
+                              default=[p for p in memoria if p in set(catalogo["Producto"])],
+                              key=f"sel_{etapa}", placeholder="Ej: Calcinit, Nitrato de potasio, MKP...")
+
+    st.subheader("2. Escribe la dosis por semana")
+    if not elegidos:
+        st.info("👆 Elige uno o más fertilizantes para empezar.")
+        df_in = pd.DataFrame({"Producto": [], "Dosis_semana": []})
+    else:
+        df_in = pd.DataFrame({"Producto": elegidos, "Dosis_semana": [float(memoria.get(p, 0.0)) for p in elegidos]})
+    editado = st.data_editor(
+        df_in, hide_index=True, width="stretch", disabled=["Producto"],
+        key=f"ed_{etapa}_{abs(hash(tuple(elegidos)))}",
         column_config={
-            "Producto": st.column_config.SelectboxColumn("Producto", options=sorted(catalogo["Producto"].tolist()),
-                                                         required=True, width="large"),
-            "Dosis_kg_ha": st.column_config.NumberColumn("Dosis (kg/ha o L/ha)", min_value=0.0, step=0.5, format="%.3f"),
+            "Producto": st.column_config.TextColumn("Fertilizante", width="large"),
+            "Dosis_semana": st.column_config.NumberColumn("Dosis (kg/ha por semana)", min_value=0.0, step=0.5,
+                                                          format="%.3f", help="Para líquidos: L/ha por semana"),
         })
-    if st.button("💾 Guardar dosis de esta etapa"):
-        nuevo = df_et_ed.dropna(subset=["Producto"]).copy()
-        nuevo["Dosis_kg_ha"] = pd.to_numeric(nuevo["Dosis_kg_ha"], errors="coerce").fillna(0.0)
+    editado["Dosis_semana"] = pd.to_numeric(editado["Dosis_semana"], errors="coerce").fillna(0.0)
+    st.session_state[ss_key] = dict(zip(editado["Producto"], editado["Dosis_semana"]))
+
+    if st.button("💾 Guardar fertilización de esta etapa", type="primary"):
+        nuevo = editado.copy()
         nuevo["Etapa"] = etapa
-        df_dosis = pd.concat([df_dosis[df_dosis["Etapa"] != etapa], nuevo[["Etapa", "Producto", "Dosis_kg_ha"]]],
-                             ignore_index=True)
-        df_dosis.to_csv(DOSIS_FILE, index=False)
-        st.success("✅ Dosis guardadas")
-        st.rerun()
+        df_dosis = pd.concat([df_dosis[df_dosis["Etapa"] != etapa], nuevo[COLS_DOSIS]], ignore_index=True)
+        guardar_dosis(df_dosis)
+        st.success("✅ Fertilización guardada")
 
-    df_et_calc = df_et_ed.dropna(subset=["Producto"]).copy()
-    df_et_calc["Dosis_kg_ha"] = pd.to_numeric(df_et_calc["Dosis_kg_ha"], errors="coerce").fillna(0.0)
-    res = calcular_dosis(df_et_calc, catalogo, d, info["semanas"], info["ferti_semana"])
+    res = calcular_dosis(editado, catalogo, d, sem, fxs)
     tabla = tabla_cumplimiento(sol, res)
+    for c in ["Solicitado", "Calculado", "Diferencia"]:
+        tabla[c] = tabla[c] / sem
+    tabla = tabla.rename(columns={"Solicitado": "Requerido/semana", "Calculado": "Aportado/semana",
+                                  "Diferencia": "Diferencia/semana"})
 
-    st.subheader("Cumplimiento: solicitado vs. calculado (kg/ha-etapa)")
+    st.subheader("3. ¿Cuánto cubres del requerimiento? (kg/ha por semana)")
     col_t, col_g = st.columns([1, 1])
     with col_t:
-        st.dataframe(tabla.style.format({"Solicitado": "{:,.3f}", "Calculado": "{:,.3f}", "Diferencia": "{:+,.3f}",
-                                         "Cumplimiento_%": "{:,.0f}%"}, na_rep="-")
+        st.dataframe(tabla.style.format({"Requerido/semana": "{:,.3f}", "Aportado/semana": "{:,.3f}",
+                                         "Diferencia/semana": "{:+,.3f}", "Cumplimiento_%": "{:,.0f}%"}, na_rep="-")
                      .map(color_cumpl, subset=["Cumplimiento_%"]),
                      hide_index=True, width="stretch", height=560)
-        st.caption("🟩 90–110%   🟨 75–125%   🟥 fuera de rango")
+        st.caption("🟩 90–110%   🟨 75–125%   🟥 fuera de rango.  Diferencia negativa = lo que te falta por semana.")
     with col_g:
         tg = tabla.dropna(subset=["Cumplimiento_%"])
         fig = go.Figure(go.Bar(x=tg["Nutriente"], y=tg["Cumplimiento_%"],
@@ -463,17 +474,22 @@ with tab_dosis:
         fig.update_layout(yaxis_title="% cumplimiento", height=560, margin=dict(t=20))
         st.plotly_chart(fig, width="stretch")
 
-    st.subheader("Aporte por producto y cantidades")
+    st.subheader("4. Programa semanal para el lote")
     if res.empty:
-        st.info("Agrega productos con dosis mayor a cero.")
+        st.info("Escribe dosis mayores a cero para ver las cantidades a aplicar.")
     else:
-        cols_show = ["Producto", "Dosis_kg_ha", "Cantidad_lote_kg", "Por_aplicacion_kg"] + NUTRIENTES
-        fmt = {c: "{:,.3f}" for c in cols_show if c != "Producto"}
-        st.dataframe(res[cols_show].style.format(fmt), hide_index=True, width="stretch")
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Total productos (kg/ha-etapa)", f"{res['Dosis_kg_ha'].sum():,.1f}")
-        k2.metric("Total para el lote (kg)", f"{res['Cantidad_lote_kg'].sum():,.2f}")
-        k3.metric("Por aplicación en el lote (kg)", f"{res['Por_aplicacion_kg'].sum():,.3f}")
+        prog = res[["Producto", "Dosis_semana", "Lote_semana_kg", "Por_aplicacion_kg", "Cantidad_lote_kg"]].rename(columns={
+            "Dosis_semana": "kg/ha por semana", "Lote_semana_kg": "Lote: kg por semana",
+            "Por_aplicacion_kg": f"Lote: kg por fertilización (÷{fxs})", "Cantidad_lote_kg": f"Lote: kg toda la etapa (×{sem} sem)"})
+        tot = prog.drop(columns="Producto").sum()
+        prog = pd.concat([prog, pd.DataFrame([{"Producto": "TOTAL", **tot}])], ignore_index=True)
+        st.dataframe(prog.style.format({c: "{:,.3f}" for c in prog.columns if c != "Producto"}),
+                     hide_index=True, width="stretch")
+        with st.expander("Ver aporte de nutrientes de cada fertilizante (kg/ha por semana)"):
+            ap = res[["Producto"] + NUTRIENTES].copy()
+            ap[NUTRIENTES] = ap[NUTRIENTES] / sem
+            st.dataframe(ap.rename(columns=ETIQUETA).style.format({ETIQUETA.get(n, n): "{:,.3f}" for n in NUTRIENTES}),
+                         hide_index=True, width="stretch")
 
 # ==========================================
 # PESTAÑA 4: RESUMEN DEL CICLO
@@ -483,23 +499,25 @@ with tab_res:
     resumen, aportes_ciclo, detalle = [], [], []
     for e in ETAPAS:
         info_e = cfg["etapas"][e]
-        r_e = calcular_dosis(df_dosis[df_dosis["Etapa"] == e][["Producto", "Dosis_kg_ha"]], catalogo, d,
-                             info_e["semanas"], info_e["ferti_semana"])
+        r_e = calcular_dosis(df_dosis[df_dosis["Etapa"] == e], catalogo, d,
+                             max(int(info_e["semanas"]), 1), max(int(info_e["ferti_semana"]), 1))
         t_e = tabla_cumplimiento(requerimiento_etapa(cfg, req, e), r_e)
         t_e["Etapa"] = e
         aportes_ciclo.append(t_e)
         r_e["Etapa"] = e
         detalle.append(r_e)
         resumen.append({"Etapa": e, "Semanas": info_e["semanas"], "Productos": len(r_e),
-                        "Total kg/ha": r_e["Dosis_kg_ha"].sum(), "Total kg lote": r_e["Cantidad_lote_kg"].sum(),
-                        "Kg por aplicación (lote)": r_e["Por_aplicacion_kg"].sum()})
+                        "kg/ha por semana": r_e["Dosis_semana"].sum(), "Total kg/ha": r_e["Dosis_kg_ha"].sum(), "Total kg lote": r_e["Cantidad_lote_kg"].sum(),
+                        "Lote kg/semana": r_e["Lote_semana_kg"].sum(),
+                        "Lote kg por fertilización": r_e["Por_aplicacion_kg"].sum()})
     df_resumen = pd.DataFrame(resumen)
     k1, k2, k3 = st.columns(3)
     k1.metric("Semanas de fertilización", f"{df_resumen['Semanas'].sum()}")
     k2.metric("Total fertilizantes (kg/ha-ciclo)", f"{df_resumen['Total kg/ha'].sum():,.1f}")
     k3.metric("Total fertilizantes del lote (kg)", f"{df_resumen['Total kg lote'].sum():,.2f}")
-    st.dataframe(df_resumen.style.format({"Total kg/ha": "{:,.2f}", "Total kg lote": "{:,.2f}",
-                                          "Kg por aplicación (lote)": "{:,.3f}"}),
+    st.dataframe(df_resumen.style.format({"kg/ha por semana": "{:,.2f}", "Total kg/ha": "{:,.2f}",
+                                          "Total kg lote": "{:,.2f}", "Lote kg/semana": "{:,.3f}",
+                                          "Lote kg por fertilización": "{:,.3f}"}),
                  hide_index=True, width="stretch")
 
     st.subheader("Cumplimiento por etapa (%)")
