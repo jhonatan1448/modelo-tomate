@@ -1,0 +1,15 @@
+# Datos locales que genera la app (no subir)
+modelo_tomate_config.json
+catalogo_fertilizantes.csv
+dosis_etapas.csv
+
+# Credenciales: NUNCA subir a GitHub
+.streamlit/secrets.toml
+*.json.key
+credenciales*.json
+service_account*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
