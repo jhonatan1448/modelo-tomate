@@ -239,6 +239,59 @@ def calcular_dosis(df_dosis_etapa, catalogo, d, semanas, ferti_sem):
     return df
 
 
+# Nutrientes que usa el cálculo automático y su peso (macros pesan más que menores)
+OPT_PESOS = {"N_Total": 1.0, "P2O5": 1.0, "K2O": 1.0, "CaO": 1.0, "MgO": 1.0, "S": 0.7,
+             "Fe": 0.4, "Mn": 0.4, "Zn": 0.4, "B": 0.4, "Cu": 0.4, "Mo": 0.2}
+
+
+def calcular_dosis_automatica(productos, catalogo, req_semana, nutrientes_usar, iteraciones=4000):
+    """Mínimos cuadrados no negativos sobre el error RELATIVO de cada nutriente.
+    Devuelve kg/ha por semana de cada producto."""
+    import numpy as np
+    cat = catalogo.set_index("Producto")
+    filas, pesos, metas = [], [], []
+    for n in nutrientes_usar:
+        meta = req_semana.get(n, 0.0)
+        if meta <= 0:
+            continue
+        if n == "N_Total":
+            fila = [(cat.at[p, "N_NO3"] + cat.at[p, "N_NH4"]) / 100 for p in productos]
+        else:
+            fila = [cat.at[p, n] / 100 for p in productos]
+        filas.append(fila); pesos.append(OPT_PESOS.get(n, 0.5)); metas.append(meta)
+    if not filas:
+        return {p: 0.0 for p in productos}
+    A = np.array(filas, dtype=float); b = np.array(metas, dtype=float); w = np.array(pesos, dtype=float)
+    Aw = A / b[:, None] * w[:, None]   # error relativo ponderado
+    bw = w.copy()
+    H = Aw.T @ Aw; g0 = Aw.T @ bw
+    x = np.zeros(len(productos))
+    diag = np.diag(H).copy()
+    for _ in range(iteraciones):          # descenso por coordenadas con x >= 0
+        cambio = 0.0
+        for j in range(len(x)):
+            if diag[j] <= 0:
+                continue
+            nuevo = max(0.0, x[j] - (H[j] @ x - g0[j]) / diag[j])
+            cambio = max(cambio, abs(nuevo - x[j])); x[j] = nuevo
+        if cambio < 1e-9:
+            break
+    return {p: round(float(v), 3) for p, v in zip(productos, x)}
+
+
+# Conversión a forma elemental / iónica para expresar ppm (mg/L)
+PPM_FORMAS = [  # (etiqueta, nutriente del modelo, factor)
+    ("N total", "N_Total", 1.0), ("N-NO3", "N_NO3", 1.0), ("NO3⁻ (como ion, HORIBA)", "N_NO3", 4.427),
+    ("N-NH4", "N_NH4", 1.0), ("P", "P2O5", 0.4364), ("K", "K2O", 0.8301), ("Ca", "CaO", 0.7147),
+    ("Mg", "MgO", 0.6030), ("S", "S", 1.0), ("Fe", "Fe", 1.0), ("Mn", "Mn", 1.0), ("Zn", "Zn", 1.0),
+    ("B", "B", 1.0), ("Cu", "Cu", 1.0), ("Mo", "Mo", 1.0)]
+
+
+def ppm_de(kg_nutriente_por_ferti, litros):
+    """kg de nutriente disueltos en una fertilización del lote -> mg/L"""
+    return kg_nutriente_por_ferti * 1e6 / litros if litros > 0 else 0.0
+
+
 def tabla_cumplimiento(sol, aportes):
     calc = {n: float(aportes[n].sum()) if n in aportes else 0.0 for n in NUTRIENTES}
     filas = [{"Nutriente": "N Total", "Solicitado": sol["N_NO3"] + sol["N_NH4"],
@@ -426,7 +479,26 @@ with tab_dosis:
                               default=[p for p in memoria if p in set(catalogo["Producto"])],
                               key=f"sel_{etapa}", placeholder="Ej: Calcinit, Nitrato de potasio, MKP...")
 
-    st.subheader("2. Escribe la dosis por semana")
+    st.subheader("2. Dosis por semana")
+    ver_key = f"ver_{etapa}"
+    st.session_state.setdefault(ver_key, 0)
+    req_sem = {"N_Total": (sol["N_NO3"] + sol["N_NH4"]) / sem, **{n: sol[n] / sem for n in REQ_NUT[1:]}}
+    with st.expander("🧮 Calcular dosis automáticamente con los fertilizantes elegidos", expanded=True):
+        st.caption("El programa busca la cantidad por semana de cada fertilizante que más se acerca al "
+                   "requerimiento semanal. Elige qué nutrientes quieres cubrir.")
+        nut_usar = st.multiselect("Nutrientes a cubrir", options=list(OPT_PESOS),
+                                  default=["N_Total", "P2O5", "K2O", "CaO", "MgO", "S"],
+                                  format_func=lambda n: ETIQUETA.get(n, n), key=f"nut_{etapa}")
+        if st.button("🧮 Calcular cuánto aplicar por semana", disabled=not elegidos, key=f"calc_{etapa}"):
+            sugeridas = calcular_dosis_automatica(elegidos, catalogo, req_sem, nut_usar)
+            st.session_state[ss_key] = sugeridas
+            memoria = sugeridas
+            st.session_state[ver_key] += 1
+            ceros = [p for p, v in sugeridas.items() if v == 0]
+            st.success("✅ Dosis calculadas. Puedes ajustarlas a mano en la tabla y luego guardar.")
+            if ceros:
+                st.info("Estos productos quedaron en 0 porque no ayudan a cubrir los nutrientes elegidos "
+                        "o los cubren mejor otros: " + ", ".join(ceros))
     if not elegidos:
         st.info("👆 Elige uno o más fertilizantes para empezar.")
         df_in = pd.DataFrame({"Producto": [], "Dosis_semana": []})
@@ -434,7 +506,7 @@ with tab_dosis:
         df_in = pd.DataFrame({"Producto": elegidos, "Dosis_semana": [float(memoria.get(p, 0.0)) for p in elegidos]})
     editado = st.data_editor(
         df_in, hide_index=True, width="stretch", disabled=["Producto"],
-        key=f"ed_{etapa}_{abs(hash(tuple(elegidos)))}",
+        key=f"ed_{etapa}_{st.session_state[ver_key]}_{abs(hash(tuple(elegidos)))}",
         column_config={
             "Producto": st.column_config.TextColumn("Fertilizante", width="large"),
             "Dosis_semana": st.column_config.NumberColumn("Dosis (kg/ha por semana)", min_value=0.0, step=0.5,
@@ -474,7 +546,51 @@ with tab_dosis:
         fig.update_layout(yaxis_title="% cumplimiento", height=560, margin=dict(t=20))
         st.plotly_chart(fig, width="stretch")
 
-    st.subheader("4. Programa semanal para el lote")
+    st.subheader("4. ¿Cuántas ppm aporta en el agua de riego?")
+    litros = st.number_input("Litros de agua por fertilización en el lote (L)", min_value=0.0,
+                             value=float(info.get("litros_ferti", 5000.0)), step=100.0, key=f"litros_{etapa}",
+                             help="Volumen total de agua en que se aplica UNA fertilización en el lote")
+    if litros != float(info.get("litros_ferti", 5000.0)):
+        cfg["etapas"][etapa]["litros_ferti"] = litros
+        guardar_config(cfg)
+    if res.empty or litros <= 0:
+        st.info("Escribe dosis y litros de agua para ver las ppm.")
+    else:
+        n_apl = sem * fxs
+        kg_ferti = {n: res[n].sum() * d["area_ha"] / n_apl for n in NUTRIENTES}  # kg nutriente por fertilización
+        kg_ferti["N_Total"] = kg_ferti["N_NO3"] + kg_ferti["N_NH4"]
+        req_ferti = {"N_Total": (sol["N_NO3"] + sol["N_NH4"]) * d["area_ha"] / n_apl,
+                     **{n: sol[n] * d["area_ha"] / n_apl for n in NUTRIENTES}}
+        filas = [{"Elemento": et, "ppm aportadas": ppm_de(kg_ferti[n] * f, litros),
+                  "ppm requeridas": ppm_de(req_ferti[n] * f, litros)} for et, n, f in PPM_FORMAS]
+        t_ppm = pd.DataFrame(filas)
+        g_l = res["Por_aplicacion_kg"].sum() * 1000 / litros
+        p1, p2 = st.columns([1, 1])
+        with p1:
+            st.dataframe(t_ppm.style.format({"ppm aportadas": "{:,.2f}", "ppm requeridas": "{:,.2f}"}),
+                         hide_index=True, width="stretch", height=560)
+        with p2:
+            st.metric("Concentración total de fertilizantes", f"{g_l:,.3f} g/L")
+            st.caption("ppm = mg por litro en el agua de riego durante la fertilización. "
+                       "P, K, Ca y Mg se expresan como elemento (no como óxido). "
+                       "NO3⁻ como ion sirve para comparar con la lectura del HORIBA en agua de riego.")
+            if g_l > 2:
+                st.warning("⚠️ Más de 2 g/L de fertilizantes: revisa la conductividad (CE) de la solución.")
+        with st.expander("Ver ppm que aporta cada fertilizante"):
+            filas = []
+            for _, r in res.iterrows():
+                fila = {"Producto": r["Producto"], "g/L": r["Por_aplicacion_kg"] * 1000 / litros}
+                kg = {n: r[n] * d["area_ha"] / n_apl for n in NUTRIENTES}
+                kg["N_Total"] = kg["N_NO3"] + kg["N_NH4"]
+                for et, n, f in PPM_FORMAS:
+                    fila[et] = ppm_de(kg[n] * f, litros)
+                filas.append(fila)
+            pp = pd.DataFrame(filas)
+            pp = pp.loc[:, (pp != 0).any(axis=0)]
+            st.dataframe(pp.style.format({c: "{:,.2f}" for c in pp.columns if c != "Producto"}),
+                         hide_index=True, width="stretch")
+
+    st.subheader("5. Programa semanal para el lote")
     if res.empty:
         st.info("Escribe dosis mayores a cero para ver las cantidades a aplicar.")
     else:
