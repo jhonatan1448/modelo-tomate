@@ -396,6 +396,53 @@ def dosis_auto_cache(productos, req_items, nutrientes, catalogo_df):
     return calcular_dosis_automatica(list(productos), catalogo_df, dict(req_items), list(nutrientes))
 
 
+DIAS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+PATRON_DIAS = {1: [0], 2: [0, 3], 3: [0, 2, 4], 4: [0, 1, 3, 4], 5: [0, 1, 2, 3, 4], 6: [0, 1, 2, 3, 4, 5],
+               7: [0, 1, 2, 3, 4, 5, 6]}
+MODOS_PLAN = ["📅 Por días: un solo tanque cada día (más fácil)", "🅰️🅱️ Dos tanques A y B todos los días"]
+TIPO_DIA = {"ca": "🟦 Día de calcio", "ps": "🟧 Día de fósforo, potasio y azufre", "todo": "Mezcla completa"}
+
+
+def plan_por_dias(res, cat_i, fxs):
+    """Reparte la dosis semanal en días. El calcio va en días distintos a fosfatos y sulfatos."""
+    grupo = {}
+    for p in res["Producto"]:
+        t, _ = proponer_tanque(cat_i.loc[p])
+        grupo[p] = "ca" if t == "A" and cat_i.at[p, "CaO"] >= 1 else ("ps" if t == "B" or cat_i.at[p, "CaO"] >= 1 else "todo")
+    # quelatos sin calcio (t == "A") se aplican con el calcio, lejos de los fosfatos
+    for p in res["Producto"]:
+        t, _ = proponer_tanque(cat_i.loc[p])
+        if t == "A" and grupo[p] == "todo":
+            grupo[p] = "ca_suave"
+    kg = dict(zip(res["Producto"], res["Lote_semana_kg"]))
+    w_ca = sum(v for p, v in kg.items() if grupo[p] == "ca")
+    w_ps = sum(v for p, v in kg.items() if grupo[p] == "ps")
+    idx = PATRON_DIAS[min(max(fxs, 1), 7)]
+    n = len(idx)
+    if w_ca > 0 and w_ps > 0:
+        if n < 2:
+            return None
+        n_ca = min(max(round(n * w_ca / (w_ca + w_ps)), 1), n - 1)
+        pos_ca = {int((i + 0.5) * n / n_ca) for i in range(n_ca)}
+        tipos = ["ca" if i in pos_ca else "ps" for i in range(n)]
+    else:
+        tipos = ["todo"] * n
+    plan = [{"dia": DIAS[j], "tipo": tipos[i], "items": []} for i, j in enumerate(idx)]
+    for p, v in kg.items():
+        g = grupo[p]
+        if g == "ca":
+            dias_p = [d_ for d_ in plan if d_["tipo"] in ("ca", "todo")]
+        elif g == "ps":
+            dias_p = [d_ for d_ in plan if d_["tipo"] in ("ps", "todo")]
+        elif g == "ca_suave":
+            dias_p = [d_ for d_ in plan if d_["tipo"] in ("ca", "todo")] or plan
+        else:
+            dias_p = plan
+        for d_ in dias_p:
+            d_["items"].append((p, v / len(dias_p)))
+    return plan
+
+
 def agregar_producto(key, prod):
     actual = list(st.session_state.get(key, []))
     if prod not in actual:
@@ -454,7 +501,7 @@ def _principal():
         k_fxs = f"fxs_{etapa}"
         if k_fxs not in st.session_state:
             st.session_state[k_fxs] = int(info["ferti_semana"])
-        fxs = st.number_input("💧 ¿Cuántas veces fertilizas por semana?", min_value=1, max_value=14, step=1, key=k_fxs)
+        fxs = st.number_input("💧 ¿Cuántas veces fertilizas por semana?", min_value=1, max_value=7, step=1, key=k_fxs)
         guardar_si_cambia(etapa, "ferti_semana", int(fxs))
         sem = max(int(info["semanas"]), 1)
         fxs = max(int(fxs), 1)
@@ -524,8 +571,9 @@ def _principal():
     cat_i = catalogo.set_index("Producto")
 
     # ---------------- PASO 3 ----------------
-    st.markdown("### 3️⃣ Cuánto aplicar")
-    st.caption(f"Para tus **{num(d['plantas'], 0)} plantas** · {fxs} fertilizaciones por semana · etapa de {sem} semanas")
+    st.markdown("### 3️⃣ Cuánto aplicar en la semana")
+    st.caption(f"Cantidades para **todas tus {num(d['plantas'], 0)} plantas juntas**, en una semana. "
+               f"En el paso 4 está cómo repartirlo día por día.")
     if res.empty:
         st.warning("Con estos fertilizantes no se cubre ningún nutriente elegido. Prueba agregando otros.")
     for _, r in res.iterrows():
@@ -533,10 +581,9 @@ def _principal():
         with st.container(border=True):
             st.markdown(
                 f"**{r['Producto']}**  \n"
-                f"<span style='font-size:1.7rem;font-weight:700'>{cantidad(r['Por_aplicacion_kg'], liq)}</span>"
-                f" <span style='color:gray'>en cada fertilización</span>  \n"
-                f"<span style='color:gray'>{cantidad(r['Lote_semana_kg'], liq)} por semana · "
-                f"{num(r['G_planta_semana'], 2)} {'mL' if liq else 'g'} por planta a la semana</span>",
+                f"<span style='font-size:1.7rem;font-weight:700'>{cantidad(r['Lote_semana_kg'], liq)}</span>"
+                f" <span style='color:gray'>por semana (todo el lote)</span>  \n"
+                f"<span style='color:gray'>{num(r['G_planta_semana'], 2)} {'mL' if liq else 'g'} por planta a la semana</span>",
                 unsafe_allow_html=True)
     ceros = [p for p in elegidos if dosis_final.get(p, 0) <= 0]
     if ceros:
@@ -590,84 +637,125 @@ def _principal():
                                        "%": "{:,.0f}%"}, na_rep="-"), hide_index=True, width="stretch")
 
     # ---------------- PASO 4 ----------------
-    st.markdown("### 4️⃣ Cómo preparar los tanques")
+    st.markdown("### 4️⃣ Plan de la semana")
     tq_txt = pd.DataFrame()
+    plan_df = pd.DataFrame()
+    k_modo = f"modo_plan_{etapa}"
+    st.session_state.setdefault(k_modo, info.get("modo_plan", MODOS_PLAN[0]))
+    modo_plan = st.radio("¿Cómo quieres aplicar?", MODOS_PLAN, key=k_modo,
+                         help="Por días: cada día preparas UN solo tanque. Dos tanques: todos los días inyectas A y B.")
+    guardar_si_cambia(etapa, "modo_plan", modo_plan)
     if res.empty:
-        st.info("Cuando haya cantidades a aplicar, aquí verás qué va en cada tanque.")
-    else:
-        with st.container(border=True):
-            t1, t2, t3 = st.columns(3)
-            k_base = f"tq_base_{etapa}"
-            base_tq = t1.radio("Preparo los tanques para:", ["Cada fertilización", "Toda la semana"], key=k_base)
-            k_va, k_vb = f"vol_a_{etapa}", f"vol_b_{etapa}"
-            st.session_state.setdefault(k_va, float(info.get("vol_a", 200.0)))
-            st.session_state.setdefault(k_vb, float(info.get("vol_b", 200.0)))
-            vol_a = t2.number_input("Litros del tanque A", min_value=1.0, step=10.0, format="%.0f", key=k_va)
-            vol_b = t3.number_input("Litros del tanque B", min_value=1.0, step=10.0, format="%.0f", key=k_vb)
-            guardar_si_cambia(etapa, "vol_a", float(vol_a))
-            guardar_si_cambia(etapa, "vol_b", float(vol_b))
+        st.info("Cuando haya cantidades a aplicar, aquí verás el plan.")
+    elif modo_plan == MODOS_PLAN[0]:
+        plan = plan_por_dias(res, cat_i, fxs)
+        if plan is None:
+            st.warning("Con 1 sola fertilización por semana no se puede separar el calcio de los fosfatos y "
+                       "sulfatos. Fertiliza al menos 2 veces por semana o usa la opción de dos tanques A y B.")
+        else:
+            k_vd = f"vol_dia_{etapa}"
+            st.session_state.setdefault(k_vd, float(info.get("vol_dia", 200.0)))
+            vol_dia = st.number_input("Litros del tanque donde preparas la mezcla", min_value=1.0, step=10.0,
+                                      format="%.0f", key=k_vd)
+            guardar_si_cambia(etapa, "vol_dia", float(vol_dia))
+            st.caption("El calcio va en días distintos a los fosfatos y sulfatos. Así, lo de cada día se mezcla "
+                       "en **un solo tanque** sin que se forme piedra.")
+            filas_plan = []
+            for dia in plan:
+                with st.container(border=True):
+                    st.markdown(f"#### 📅 {dia['dia']}  \n<span style='color:gray'>{TIPO_DIA[dia['tipo']]}</span>",
+                                unsafe_allow_html=True)
+                    lineas = []
+                    for prod_, kg_ in dia["items"]:
+                        lineas.append(f"- **{cantidad(kg_, es_liquido(prod_))}** de {prod_}")
+                        filas_plan.append({"Día": dia["dia"], "Producto": prod_, "kg": round(kg_, 3)})
+                    st.markdown("\n".join(lineas))
+                    tot = sum(k for _, k in dia["items"])
+                    conc = tot * 1000 / vol_dia
+                    if conc > 250:
+                        st.warning(f"Muy concentrado ({num(conc, 0)} g por litro). Usa un tanque más grande.")
+            plan_df = pd.DataFrame(filas_plan)
+            st.caption("👉 Llena 2/3 del tanque con agua, disuelve un producto a la vez revolviendo y completa con agua.")
 
-        col_kg = "Por_aplicacion_kg" if base_tq == "Cada fertilización" else "Lote_semana_kg"
-        tq = res[["Producto", col_kg]].rename(columns={col_kg: "kg"}).reset_index(drop=True)
-        props = [proponer_tanque(cat_i.loc[p]) for p in tq["Producto"]]
-        tq["Tanque"] = [t for t, _ in props]
-        tq["Motivo"] = [m for _, m in props]
-        carga = {"A": tq.loc[tq["Tanque"] == "A", "kg"].sum(), "B": tq.loc[tq["Tanque"] == "B", "kg"].sum()}
-        for i_, r in tq[tq["Tanque"] == "A/B"].sort_values("kg", ascending=False).iterrows():
-            destino = "A" if carga["A"] <= carga["B"] else "B"
-            tq.at[i_, "Tanque"] = destino
-            carga[destino] += r["kg"]
-        cambios = dict(info.get("tanques", {}))
-        tq["Tanque"] = [cambios.get(p_, t_) for p_, t_ in zip(tq["Producto"], tq["Tanque"])]
+    if modo_plan.startswith("🅰️"):
+        if res.empty:
+            st.info("Cuando haya cantidades a aplicar, aquí verás qué va en cada tanque.")
+        else:
+            with st.container(border=True):
+                t1, t2, t3 = st.columns(3)
+                k_base = f"tq_base_{etapa}"
+                base_tq = t1.radio("Preparo los tanques para:", ["Cada fertilización", "Toda la semana"], key=k_base,
+                                   help=f"Cada fertilización = lo de un día de riego con fertilizante ({fxs} por semana)")
+                k_va, k_vb = f"vol_a_{etapa}", f"vol_b_{etapa}"
+                st.session_state.setdefault(k_va, float(info.get("vol_a", 200.0)))
+                st.session_state.setdefault(k_vb, float(info.get("vol_b", 200.0)))
+                vol_a = t2.number_input("Litros del tanque A", min_value=1.0, step=10.0, format="%.0f", key=k_va)
+                vol_b = t3.number_input("Litros del tanque B", min_value=1.0, step=10.0, format="%.0f", key=k_vb)
+                guardar_si_cambia(etapa, "vol_a", float(vol_a))
+                guardar_si_cambia(etapa, "vol_b", float(vol_b))
 
-        ca_, cb_ = st.columns(2)
-        for col_, t_, vol, color in [(ca_, "A", vol_a, "🟦"), (cb_, "B", vol_b, "🟧")]:
-            sub = tq[tq["Tanque"] == t_]
-            with col_.container(border=True):
-                st.markdown(f"#### {color} Tanque {t_}")
-                st.caption(f"{num(vol, 0)} litros de agua")
-                if sub.empty:
-                    st.write("— Vacío —")
-                    continue
-                for _, r in sub.iterrows():
-                    st.markdown(f"- **{cantidad(r['kg'], es_liquido(r['Producto']))}** de {r['Producto']}")
-                conc = sub["kg"].sum() * 1000 / vol
-                if conc > 250:
-                    st.warning(f"Muy concentrado ({num(conc, 0)} g por litro): puede no disolverse. "
-                               "Usa más agua o prepáralo para cada fertilización.")
+            col_kg = "Por_aplicacion_kg" if base_tq == "Cada fertilización" else "Lote_semana_kg"
+            tq = res[["Producto", col_kg]].rename(columns={col_kg: "kg"}).reset_index(drop=True)
+            props = [proponer_tanque(cat_i.loc[p]) for p in tq["Producto"]]
+            tq["Tanque"] = [t for t, _ in props]
+            tq["Motivo"] = [m for _, m in props]
+            carga = {"A": tq.loc[tq["Tanque"] == "A", "kg"].sum(), "B": tq.loc[tq["Tanque"] == "B", "kg"].sum()}
+            for i_, r in tq[tq["Tanque"] == "A/B"].sort_values("kg", ascending=False).iterrows():
+                destino = "A" if carga["A"] <= carga["B"] else "B"
+                tq.at[i_, "Tanque"] = destino
+                carga[destino] += r["kg"]
+            cambios = dict(info.get("tanques", {}))
+            tq["Tanque"] = [cambios.get(p_, t_) for p_, t_ in zip(tq["Producto"], tq["Tanque"])]
 
-        comp_tq = {t_: tq.loc[tq["Tanque"] == t_, "Producto"].tolist() for t_ in "AB"}
-        problema = False
-        for t_ in "AB":
-            con_ca = [p_ for p_ in comp_tq[t_] if cat_i.at[p_, "CaO"] >= 1]
-            con_ps = [p_ for p_ in comp_tq[t_] if cat_i.at[p_, "P2O5"] >= 1 or cat_i.at[p_, "S"] >= 1]
-            if [x for x in con_ca if x not in con_ps] and [x for x in con_ps if x not in con_ca]:
-                problema = True
-                st.error(f"❌ En el tanque {t_} hay calcio junto con fosfatos o sulfatos. Se forma una piedra "
-                         "que tapa los goteros. Cámbialos de tanque abajo.")
-            for x in [x for x in con_ca if x in con_ps]:
-                st.warning(f"⚠️ {x} trae calcio y fosfato/sulfato juntos. Revisa la etiqueta o aplícalo aparte.")
-        if not problema:
-            st.success("✅ La mezcla está bien: el calcio (tanque A) no se junta con fosfatos ni sulfatos (tanque B).")
+            ca_, cb_ = st.columns(2)
+            for col_, t_, vol, color in [(ca_, "A", vol_a, "🟦"), (cb_, "B", vol_b, "🟧")]:
+                sub = tq[tq["Tanque"] == t_]
+                with col_.container(border=True):
+                    st.markdown(f"#### {color} Tanque {t_}")
+                    st.caption(f"{num(vol, 0)} litros de agua")
+                    if sub.empty:
+                        st.write("— Vacío —")
+                        continue
+                    for _, r in sub.iterrows():
+                        st.markdown(f"- **{cantidad(r['kg'], es_liquido(r['Producto']))}** de {r['Producto']}")
+                    conc = sub["kg"].sum() * 1000 / vol
+                    if conc > 250:
+                        st.warning(f"Muy concentrado ({num(conc, 0)} g por litro): puede no disolverse. "
+                                   "Usa más agua o prepáralo para cada fertilización.")
 
-        with st.expander("🔄 Cambiar un fertilizante de tanque"):
-            st.caption("La app ya los separó. Cámbialos solo si sabes lo que haces.")
-            for _, r in tq.iterrows():
-                cc1, cc2 = st.columns([3, 1])
-                cc1.markdown(f"{r['Producto']}  \n<small>{r['Motivo']}</small>", unsafe_allow_html=True)
-                nuevo = cc2.radio("Tanque", ["A", "B"], index=0 if r["Tanque"] == "A" else 1, horizontal=True,
-                                  key=f"mv_{etapa}_{r['Producto']}", label_visibility="collapsed")
-                if nuevo != r["Tanque"]:
-                    cambios[r["Producto"]] = nuevo
-                    guardar_si_cambia(etapa, "tanques", cambios)
+            comp_tq = {t_: tq.loc[tq["Tanque"] == t_, "Producto"].tolist() for t_ in "AB"}
+            problema = False
+            for t_ in "AB":
+                con_ca = [p_ for p_ in comp_tq[t_] if cat_i.at[p_, "CaO"] >= 1]
+                con_ps = [p_ for p_ in comp_tq[t_] if cat_i.at[p_, "P2O5"] >= 1 or cat_i.at[p_, "S"] >= 1]
+                if [x for x in con_ca if x not in con_ps] and [x for x in con_ps if x not in con_ca]:
+                    problema = True
+                    st.error(f"❌ En el tanque {t_} hay calcio junto con fosfatos o sulfatos. Se forma una piedra "
+                             "que tapa los goteros. Cámbialos de tanque abajo.")
+                for x in [x for x in con_ca if x in con_ps]:
+                    st.warning(f"⚠️ {x} trae calcio y fosfato/sulfato juntos. Revisa la etiqueta o aplícalo aparte.")
+            if not problema:
+                st.success("✅ La mezcla está bien: el calcio (tanque A) no se junta con fosfatos ni sulfatos (tanque B).")
+
+            with st.expander("🔄 Cambiar un fertilizante de tanque"):
+                st.caption("La app ya los separó. Cámbialos solo si sabes lo que haces.")
+                for _, r in tq.iterrows():
+                    cc1, cc2 = st.columns([3, 1])
+                    cc1.markdown(f"{r['Producto']}  \n<small>{r['Motivo']}</small>", unsafe_allow_html=True)
+                    nuevo = cc2.radio("Tanque", ["A", "B"], index=0 if r["Tanque"] == "A" else 1, horizontal=True,
+                                      key=f"mv_{etapa}_{r['Producto']}", label_visibility="collapsed")
+                    if nuevo != r["Tanque"]:
+                        cambios[r["Producto"]] = nuevo
+                        guardar_si_cambia(etapa, "tanques", cambios)
+                        st.rerun()
+                if cambios and st.button("↩️ Volver a la propuesta de la app", key=f"reset_tq_{etapa}"):
+                    guardar_si_cambia(etapa, "tanques", {})
+                    for k in [k for k in st.session_state if k.startswith(f"mv_{etapa}_")]:
+                        del st.session_state[k]
                     st.rerun()
-            if cambios and st.button("↩️ Volver a la propuesta de la app", key=f"reset_tq_{etapa}"):
-                guardar_si_cambia(etapa, "tanques", {})
-                for k in [k for k in st.session_state if k.startswith(f"mv_{etapa}_")]:
-                    del st.session_state[k]
-                st.rerun()
-        st.caption("👉 Llena 2/3 del tanque con agua, disuelve un producto a la vez revolviendo y completa con agua.")
-        tq_txt = tq
+            st.caption("👉 Llena 2/3 del tanque con agua, disuelve un producto a la vez revolviendo y completa con agua.")
+            tq_txt = tq
+
 
     # ---------------- PPM (opcional) ----------------
     with st.expander("💧 Ver ppm en el agua de riego (para comparar con el HORIBA)"):
@@ -704,6 +792,8 @@ def _principal():
         datos_df.to_excel(w, index=False, sheet_name="Receta", startrow=0)
         receta.to_excel(w, index=False, sheet_name="Receta", startrow=len(datos_df) + 2)
         estado_df.to_excel(w, index=False, sheet_name="Nutrientes")
+        if not plan_df.empty:
+            plan_df.to_excel(w, index=False, sheet_name="Plan semanal")
     st.download_button("📥 Descargar la receta (Excel)", data=buf.getvalue(), type="primary", width="stretch",
                        file_name=f"receta_{etapa.split(' - ')[1].lower()}_{datetime.now():%Y%m%d}.xlsx")
 
