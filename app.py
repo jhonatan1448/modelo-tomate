@@ -542,9 +542,23 @@ def _principal():
         sem = max(int(info["semanas"]), 1)
         fxs = max(int(fxs), 1)
 
+        if "nivel_main" not in st.session_state:
+            st.session_state["nivel_main"] = int(cfg.get("nivel", 100))
+        nivel = st.select_slider("💰 ¿A qué nivel quieres fertilizar?", options=[20, 30, 40, 50, 60, 70, 80, 90, 100],
+                                 key="nivel_main",
+                                 format_func=lambda v: f"{v}%" + (" (lo ideal)" if v == 100 else ""),
+                                 help="100% = todo lo que la planta necesita. Si el presupuesto no alcanza, bájalo.")
+        if int(nivel) != int(cfg.get("nivel", 100)):
+            cfg["nivel"] = int(nivel)
+            guardar_config(cfg)
+        if nivel < 100:
+            st.warning(f"Vas a aplicar el **{nivel}%** de lo que la planta necesita. Ahorras fertilizante, "
+                       "pero la producción puede bajar.")
+
     sol = requerimiento_etapa(cfg, req, etapa)
     fac = d["area_ha"] / sem   # kg/ha-etapa -> kg por semana para las plantas
-    req_sem = {"N_Total": (sol["N_NO3"] + sol["N_NH4"]) * fac, **{n: sol[n] * fac for n in REQ_NUT[1:]}}
+    req_ideal = {"N_Total": (sol["N_NO3"] + sol["N_NH4"]) * fac, **{n: sol[n] * fac for n in REQ_NUT[1:]}}
+    req_sem = {n: v * nivel / 100 for n, v in req_ideal.items()}   # lo que se va a aplicar según el nivel
 
     # ---------------- PASO 2 ----------------
     st.markdown("### 2️⃣ Elige tus fertilizantes")
@@ -576,6 +590,11 @@ def _principal():
     dosis_final = dosis_auto_cache(tuple(elegidos), tuple(sorted(req_sem.items())), tuple(nut_eval), catalogo,
                                    tuple(sorted(fijos.items())))
     dosis_final = {p: float(dosis_final.get(p, 0.0)) for p in elegidos}
+    if nivel < 100:
+        dosis_100 = dosis_auto_cache(tuple(elegidos), tuple(sorted(req_ideal.items())), tuple(nut_eval), catalogo,
+                                     tuple(sorted(fijos.items())))
+    else:
+        dosis_100 = dosis_final
 
     # guardar dosis usadas (para el resumen del ciclo)
     actuales = df_dosis[df_dosis["Etapa"] == etapa]
@@ -593,6 +612,13 @@ def _principal():
     st.markdown("### 3️⃣ Cuánto aplicar en la semana")
     st.caption(f"Cantidades para **todas tus {num(d['plantas'], 0)} plantas juntas**, en una semana. "
                f"En el paso 4 está cómo repartirlo día por día.")
+    if nivel < 100:
+        tot_100, tot_niv = sum(dosis_100.values()), sum(dosis_final.values())
+        with st.container(border=True):
+            st.markdown(f"💰 **Fertilización al {nivel}%**  \n"
+                        f"Al 100% serían **{num(tot_100, 2)} kg** por semana · al {nivel}% son **{num(tot_niv, 2)} kg**  \n"
+                        f"<span style='color:green'>Ahorras {num(max(tot_100 - tot_niv, 0), 2)} kg de fertilizante "
+                        f"por semana</span>", unsafe_allow_html=True)
     st.info("✋ ¿Quieres más de un producto y menos de otro? Súbele o bájale con **−** y **+**. "
             "La app ajusta los demás para que la planta siga recibiendo lo que necesita.")
     for p in elegidos:
@@ -627,6 +653,10 @@ def _principal():
         else:
             aporte[n] = res[n].sum() * fac if not res.empty else 0.0
     pcts = {n: (aporte[n] / req_sem[n] * 100 if req_sem.get(n) else None) for n in nut_eval}
+    pcts_ideal = {n: (aporte[n] / req_ideal[n] * 100 if req_ideal.get(n) else None) for n in nut_eval}
+    if nivel < 100:
+        st.caption(f"El semáforo compara contra tu plan al **{nivel}%**. Frente a lo ideal (100%), la planta recibe "
+                   f"en promedio el **{num(sum(v for v in pcts_ideal.values() if v) / max(len([v for v in pcts_ideal.values() if v]), 1), 0)}%**.")
     with st.container(border=True):
         lineas = []
         for n in nut_eval:
@@ -658,11 +688,14 @@ def _principal():
 
     with st.expander("🔢 Ver el detalle en números"):
         det = pd.DataFrame({"Nutriente": [NOMBRES[n] for n in nut_eval],
-                            "Necesita (kg/semana)": [req_sem[n] for n in nut_eval],
+                            "Ideal 100% (kg/semana)": [req_ideal[n] for n in nut_eval],
+                            f"Plan al {nivel}% (kg/semana)": [req_sem[n] for n in nut_eval],
                             "Recibe (kg/semana)": [aporte[n] for n in nut_eval],
-                            "%": [pcts[n] for n in nut_eval]})
-        st.dataframe(det.style.format({"Necesita (kg/semana)": "{:,.3f}", "Recibe (kg/semana)": "{:,.3f}",
-                                       "%": "{:,.0f}%"}, na_rep="-"), hide_index=True, width="stretch")
+                            "% del plan": [pcts[n] for n in nut_eval],
+                            "% de lo ideal": [pcts_ideal[n] for n in nut_eval]})
+        st.dataframe(det.style.format({c: "{:,.3f}" for c in det.columns[1:4]} |
+                                      {"% del plan": "{:,.0f}%", "% de lo ideal": "{:,.0f}%"}, na_rep="-"),
+                     hide_index=True, width="stretch")
 
     # ---------------- PASO 4 ----------------
     st.markdown("### 4️⃣ Plan de la semana")
@@ -799,8 +832,10 @@ def _principal():
             rq_f = {"N_Total": (sol["N_NO3"] + sol["N_NH4"]) * d["area_ha"] / n_apl,
                     **{n: sol[n] * d["area_ha"] / n_apl for n in NUTRIENTES}}
             t_ppm = pd.DataFrame([{"Elemento": et, "ppm que pones": ppm_de(kg_f[n] * f, litros),
-                                   "ppm que necesita": ppm_de(rq_f[n] * f, litros)} for et, n, f in PPM_FORMAS])
-            st.dataframe(t_ppm.style.format({"ppm que pones": "{:,.1f}", "ppm que necesita": "{:,.1f}"}),
+                                   "ppm ideal (100%)": ppm_de(rq_f[n] * f, litros)} for et, n, f in PPM_FORMAS])
+            if nivel < 100:
+                t_ppm[f"ppm al {nivel}%"] = t_ppm["ppm ideal (100%)"] * nivel / 100
+            st.dataframe(t_ppm.style.format({c: "{:,.1f}" for c in t_ppm.columns if c != "Elemento"}),
                          hide_index=True, width="stretch")
             st.caption("ppm = miligramos por litro. NO3⁻ (ion) es el valor que se compara con el HORIBA.")
 
@@ -812,9 +847,11 @@ def _principal():
         receta = receta.merge(tq_txt[["Producto", "Tanque"]], on="Producto", how="left")
     estado_df = pd.DataFrame({"Nutriente": [NOMBRES[n] for n in nut_eval],
                               "Estado": [estado(pcts[n])[1] for n in nut_eval],
-                              "% cubierto": [round(pcts[n] or 0) for n in nut_eval]})
-    datos_df = pd.DataFrame({"Dato": ["Etapa", "Plantas", "Fertilizaciones por semana", "Semanas de la etapa", "Fecha"],
-                             "Valor": [etapa, d["plantas"], fxs, sem, f"{datetime.now():%Y-%m-%d}"]})
+                              "% del plan": [round(pcts[n] or 0) for n in nut_eval],
+                              "% de lo ideal": [round(pcts_ideal[n] or 0) for n in nut_eval]})
+    datos_df = pd.DataFrame({"Dato": ["Etapa", "Plantas", "Fertilizaciones por semana", "Semanas de la etapa",
+                                      "Nivel de fertilización", "Fecha"],
+                             "Valor": [etapa, d["plantas"], fxs, sem, f"{nivel}%", f"{datetime.now():%Y-%m-%d}"]})
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         datos_df.to_excel(w, index=False, sheet_name="Receta", startrow=0)
