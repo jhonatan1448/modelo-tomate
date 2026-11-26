@@ -8,7 +8,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="Modelo de Fertilización - TOMATE", layout="wide")
+st.set_page_config(page_title="Modelo de Fertilización - TOMATE", layout="centered")
 
 CONFIG_FILE = "modelo_tomate_config.json"
 CATALOGO_FILE = "catalogo_fertilizantes.csv"
@@ -283,6 +283,25 @@ def calcular_dosis_automatica(productos, catalogo, req_semana, nutrientes_usar, 
     return {p: round(float(v), 3) for p, v in zip(productos, x)}
 
 
+def proponer_tanque(fila):
+    """Regla clásica A/B: el calcio no puede ir con fosfatos ni sulfatos (precipitan)."""
+    ca, p, s = fila["CaO"] >= 1, fila["P2O5"] >= 1, fila["S"] >= 1
+    micro_quelato = (fila["Fe"] + fila["Mn"] + fila["Zn"] + fila["Cu"]) > 0 and not (p or s)
+    if ca and (p or s):
+        return "A", "⚠️ Trae calcio y también fosfato/sulfato: aplícalo aparte"
+    if ca:
+        return "A", "Lleva calcio"
+    if p and s:
+        return "B", "Lleva fosfato y sulfato"
+    if p:
+        return "B", "Lleva fosfato"
+    if s:
+        return "B", "Lleva sulfato"
+    if micro_quelato:
+        return "A", "Quelato de micros (mejor lejos de fosfatos)"
+    return "A/B", "Compatible con ambos (se reparte para equilibrar)"
+
+
 # Conversión a forma elemental / iónica para expresar ppm (mg/L)
 PPM_FORMAS = [  # (etiqueta, nutriente del modelo, factor)
     ("N total", "N_Total", 1.0), ("N-NO3", "N_NO3", 1.0), ("NO3⁻ (como ion, HORIBA)", "N_NO3", 4.427),
@@ -327,302 +346,376 @@ df_dosis = cargar_dosis()
 d = diseno(cfg)
 req = requerimiento_ciclo(cfg, d)
 
-with st.sidebar:
-    st.header("💾 Respaldo de tu programa")
-    st.caption("En Streamlit Cloud los datos se pueden borrar al reiniciarse la app. "
-               "Descarga tu programa y vuelve a cargarlo cuando lo necesites.")
-    st.download_button("📥 Descargar mi fertilización (CSV)", data=df_dosis.to_csv(index=False).encode("utf-8"),
-                       file_name=f"fertilizacion_tomate_{datetime.now():%Y%m%d}.csv", mime="text/csv")
-    subido = st.file_uploader("Cargar fertilización guardada", type="csv")
-    if subido is not None and st.button("♻️ Restaurar este archivo"):
-        df_up = pd.read_csv(subido)
-        if all(c in df_up.columns for c in COLS_DOSIS):
-            guardar_dosis(df_up)
-            for k in [k for k in st.session_state if k.startswith(("dosis_mem_", "sel_"))]:
-                del st.session_state[k]
-            st.success("✅ Fertilización restaurada")
-            st.rerun()
-        else:
-            st.error("El archivo no tiene las columnas Etapa, Producto, Dosis_lote_semana.")
+# ------------------------------------------------------------------
+# AYUDAS PARA LA PANTALLA SENCILLA
+# ------------------------------------------------------------------
+NOMBRES = {"N_Total": "Nitrógeno (N)", "P2O5": "Fósforo (P)", "K2O": "Potasio (K)", "CaO": "Calcio (Ca)",
+           "MgO": "Magnesio (Mg)", "S": "Azufre (S)", "Fe": "Hierro (Fe)", "Mn": "Manganeso (Mn)",
+           "Zn": "Zinc (Zn)", "B": "Boro (B)", "Cu": "Cobre (Cu)", "Mo": "Molibdeno (Mo)"}
+MACROS = ["N_Total", "P2O5", "K2O", "CaO", "MgO", "S"]
+MICROS = ["Fe", "Mn", "Zn", "B", "Cu", "Mo"]
+ICONO_ETAPA = {"Etapa 1 - Vegetativo": "🌱", "Etapa 2 - Desarrollo": "🌿", "Etapa 3 - Llenado": "🍅"}
 
-st.title("🍅 Modelo de Fertilización - Cultivo de TOMATE")
-st.write("Diseño agronómico, requerimientos por etapa fenológica, cálculo de dosis con hidrosolubles.")
 
-tab_dis, tab_req, tab_dosis, tab_res, tab_cat = st.tabs([
-    "🌱 Diseño del Cultivo", "📆 Requerimientos por Etapa", "🧪 Fertilización Semanal",
-    "📋 Resumen del Ciclo", "📚 Catálogo de Fertilizantes"])
+def num(x, dec=2):
+    """Número al estilo colombiano: 1.234,56"""
+    return f"{x:,.{dec}f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-# ==========================================
-# PESTAÑA 1: DISEÑO DEL CULTIVO
-# ==========================================
-with tab_dis:
-    st.header("Diseño agronómico")
-    with st.form("form_diseno"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            dist_surcos = st.number_input("Distancia entre surcos / caminos (m)", 0.1, 5.0, float(cfg["dist_surcos"]), 0.05)
-            dist_plantas = st.number_input("Espaciamiento entre plantas (m)", 0.05, 3.0, float(cfg["dist_plantas"]), 0.01)
-            plantas = st.number_input("Plantas sembradas en el lote", 1, 10_000_000, int(cfg["plantas_sembradas"]), 100)
-        with c2:
-            prod_std = st.number_input("Producción estándar (kg/planta)", 0.1, 30.0, float(cfg["prod_estandar"]), 0.5)
-            prod_obj = st.number_input("Producción objetivo (kg/planta)", 0.1, 30.0, float(cfg["prod_objetivo"]), 0.5)
-            fc = st.number_input("Factor de corrección (F.C.)", 0.1, 3.0, float(cfg["factor_correccion"]), 0.05)
-        with c3:
-            base = st.radio("Calcular requerimiento con:", ["Producción estándar", "Producción objetivo"],
-                            index=0 if cfg["base_requerimiento"] == "Producción estándar" else 1)
-            frac_no3 = st.slider("Fracción del N como nitrato (NO3)", 0.0, 1.0, float(cfg["frac_no3"]), 0.05)
 
-        st.markdown("**Extracción (kg por tonelada producida) y % de aporte a suplir con fertilizante**")
-        df_ext = pd.DataFrame({
-            "Nutriente": [ETIQUETA.get(n, n) for n in REQ_NUT],
-            "Extraccion_kg_ton": [cfg["extraccion"][n] for n in REQ_NUT],
-            "Factor_suelo": [cfg["aporte_suelo"][n] for n in REQ_NUT],
-        })
-        df_ext_ed = st.data_editor(df_ext, hide_index=True, width="stretch", disabled=["Nutriente"],
-                                   key="ed_ext",
-                                   column_config={"Factor_suelo": st.column_config.NumberColumn(
-                                       "Factor suelo (1 = 100%)", help="Reduce si el análisis de suelo aporta parte del nutriente")})
-        guardar = st.form_submit_button("💾 Guardar diseño")
-    if guardar:
-        cfg.update({"dist_surcos": dist_surcos, "dist_plantas": dist_plantas, "plantas_sembradas": int(plantas),
-                    "prod_estandar": prod_std, "prod_objetivo": prod_obj, "factor_correccion": fc,
-                    "base_requerimiento": base, "frac_no3": frac_no3})
-        cfg["extraccion"] = dict(zip(REQ_NUT, df_ext_ed["Extraccion_kg_ton"].astype(float)))
-        cfg["aporte_suelo"] = dict(zip(REQ_NUT, df_ext_ed["Factor_suelo"].astype(float)))
+def cantidad(kg, liquido=False):
+    if liquido:
+        return f"{num(kg * 1000, 0)} mL" if kg < 1 else f"{num(kg, 2)} L"
+    return f"{num(kg * 1000, 0)} g" if kg < 1 else f"{num(kg, 2)} kg"
+
+
+def es_liquido(nombre):
+    n = nombre.upper()
+    return "LIQ" in n or "LÍQ" in n
+
+
+def estado(pct):
+    if pct is None:
+        return "⚪", "Sin dato"
+    if pct < 75:
+        return "🔴", "Falta"
+    if pct < 90:
+        return "🟡", "Un poco bajo"
+    if pct <= 110:
+        return "✅", "Bien"
+    if pct <= 125:
+        return "🟡", "Un poco alto"
+    return "🔴", "Se pasa"
+
+
+def contenido(cat_row, n):
+    return cat_row["N_NO3"] + cat_row["N_NH4"] if n == "N_Total" else cat_row[n]
+
+
+@st.cache_data(show_spinner=False)
+def dosis_auto_cache(productos, req_items, nutrientes, catalogo_df):
+    return calcular_dosis_automatica(list(productos), catalogo_df, dict(req_items), list(nutrientes))
+
+
+def agregar_producto(key, prod):
+    actual = list(st.session_state.get(key, []))
+    if prod not in actual:
+        actual.append(prod)
+    st.session_state[key] = actual
+
+
+def guardar_si_cambia(e, clave, valor):
+    if cfg["etapas"][e].get(clave) != valor:
+        cfg["etapas"][e][clave] = valor
         guardar_config(cfg)
-        st.success("✅ Diseño guardado")
-        st.rerun()
 
-    st.markdown("---")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Densidad de siembra", f"{d['densidad']:,.0f} pl/ha")
-    m2.metric("Área del lote", f"{d['area_ha']:.3f} ha")
-    m3.metric("Prod. estándar", f"{d['ton_std']:,.1f} t/ha")
-    m4.metric("Prod. objetivo", f"{d['ton_obj']:,.1f} t/ha")
 
-    st.subheader(f"Requerimiento del ciclo (kg/ha) — base: {cfg['base_requerimiento'].lower()}")
-    df_req = pd.DataFrame({"Nutriente": [ETIQUETA.get(n, n) for n in REQ_NUT],
-                           "kg/ha-ciclo": [req[n] for n in REQ_NUT],
-                           "kg en el lote": [req[n] * d["area_ha"] for n in REQ_NUT],
-                           "g por planta-ciclo": [req[n] * d["area_ha"] * 1000 / d["plantas"] for n in REQ_NUT]})
-    st.dataframe(df_req.style.format({"kg/ha-ciclo": "{:,.3f}", "kg en el lote": "{:,.3f}", "g por planta-ciclo": "{:,.3f}"}),
-                 hide_index=True, width="stretch")
+# ------------------------------------------------------------------
+# ENCABEZADO
+# ------------------------------------------------------------------
+st.title("🍅 Fertilización del Tomate")
+st.write("Elige tus fertilizantes y la app te dice **cuánto aplicar** y **cómo preparar los tanques**.")
+
+tab_main, tab_res, tab_adv = st.tabs(["🍅 Mi fertilización", "📋 Resumen y copia", "⚙️ Configuración avanzada"])
 
 # ==========================================
-# PESTAÑA 2: REQUERIMIENTOS POR ETAPA
+# PESTAÑA PRINCIPAL (SENCILLA)
 # ==========================================
-with tab_req:
-    st.header("Distribución del requerimiento por etapa fenológica")
-    st.write("✏️ Edita el % de cada nutriente por etapa, las semanas y las fertilizaciones por semana. Cada columna debería sumar 100%.")
-    filas = []
-    for e in ETAPAS:
-        fila = {"Etapa": e, "Semanas": cfg["etapas"][e]["semanas"], "Ferti/semana": cfg["etapas"][e]["ferti_semana"]}
-        fila.update({ETIQUETA.get(n, n): cfg["etapas"][e]["pct"][n] for n in REQ_NUT})
-        filas.append(fila)
-    df_pct = pd.DataFrame(filas)
-    df_pct_ed = st.data_editor(df_pct, hide_index=True, width="stretch", disabled=["Etapa"], key="ed_pct")
+def _principal():
+    global df_dosis
+    with st.expander("❓ ¿Cómo se usa? (toca aquí)"):
+        st.markdown(
+            "1. Escribe **cuántas plantas** tienes y en qué **etapa** está el cultivo.\n"
+            "2. **Elige los fertilizantes** que tienes en la finca.\n"
+            "3. La app calcula **sola** cuánto aplicar y te dice si a la planta le **falta** o le **sobra** algo.\n"
+            "4. Mira **cómo preparar los tanques A y B** y descarga la receta.\n\n"
+            "Todo se guarda solo. Lo técnico (extracciones, % por etapa, catálogo) está en ⚙️ Configuración avanzada.")
 
-    sumas = {ETIQUETA.get(n, n): df_pct_ed[ETIQUETA.get(n, n)].sum() for n in REQ_NUT}
-    malas = {k: v for k, v in sumas.items() if abs(v - 100) > 0.01}
-    if malas:
-        st.warning("⚠️ Estos nutrientes no suman 100% entre las 3 etapas: " +
-                   ", ".join(f"{k} = {v:g}%" for k, v in malas.items()))
-    if st.button("💾 Guardar distribución por etapas"):
-        for _, r in df_pct_ed.iterrows():
-            e = r["Etapa"]
-            cfg["etapas"][e]["semanas"] = int(r["Semanas"])
-            cfg["etapas"][e]["ferti_semana"] = int(r["Ferti/semana"])
-            cfg["etapas"][e]["pct"] = {n: float(r[ETIQUETA.get(n, n)]) for n in REQ_NUT}
-        guardar_config(cfg)
-        st.success("✅ Distribución guardada")
-        st.rerun()
+    # ---------------- PASO 1 ----------------
+    st.markdown("### 1️⃣ Tu cultivo")
+    with st.container(border=True):
+        c1, c2 = st.columns(2)
+        if "plantas_main" not in st.session_state:
+            st.session_state["plantas_main"] = int(cfg["plantas_sembradas"])
+        plantas = c1.number_input("🌱 ¿Cuántas plantas tienes?", min_value=1, step=100, key="plantas_main")
+        campo_prod = "prod_estandar" if cfg["base_requerimiento"] == "Producción estándar" else "prod_objetivo"
+        if "prod_main" not in st.session_state:
+            st.session_state["prod_main"] = float(cfg[campo_prod])
+        prod = c2.number_input("🍅 ¿Cuántos kg de tomate esperas por planta?", min_value=0.5, max_value=30.0,
+                               step=0.5, format="%.1f", key="prod_main")
+        if int(plantas) != cfg["plantas_sembradas"] or float(prod) != float(cfg[campo_prod]):
+            cfg["plantas_sembradas"], cfg[campo_prod] = int(plantas), float(prod)
+            guardar_config(cfg)
+        d = diseno(cfg)
+        req = requerimiento_ciclo(cfg, d)
 
-    total_sem = sum(cfg["etapas"][e]["semanas"] for e in ETAPAS)
-    st.caption(f"Duración total de las etapas: {total_sem} semanas ({total_sem * 7} días)")
+        etapa = st.radio("📅 ¿En qué etapa está el cultivo?", ETAPAS, horizontal=True, key="etapa_sel",
+                         format_func=lambda e: f"{ICONO_ETAPA[e]} {e.split(' - ')[1]} ({cfg['etapas'][e]['semanas']} sem)")
+        info = cfg["etapas"][etapa]
+        k_fxs = f"fxs_{etapa}"
+        if k_fxs not in st.session_state:
+            st.session_state[k_fxs] = int(info["ferti_semana"])
+        fxs = st.number_input("💧 ¿Cuántas veces fertilizas por semana?", min_value=1, max_value=14, step=1, key=k_fxs)
+        guardar_si_cambia(etapa, "ferti_semana", int(fxs))
+        sem = max(int(info["semanas"]), 1)
+        fxs = max(int(fxs), 1)
 
-    st.subheader(f"Requerimiento por etapa (kg para {d['plantas']:,} plantas)")
-    filas = []
-    for e in ETAPAS:
-        r = requerimiento_etapa(cfg, req, e)
-        a = d["area_ha"]
-        fila = {"Etapa": e, "N Total": (r["N_NO3"] + r["N_NH4"]) * a}
-        fila.update({ETIQUETA.get(n, n): r[n] * a for n in NUTRIENTES})
-        filas.append(fila)
-    df_req_et = pd.DataFrame(filas)
-    st.dataframe(df_req_et.style.format({c: "{:,.3f}" for c in df_req_et.columns if c != "Etapa"}),
-                 hide_index=True, width="stretch")
-    df_plot = df_req_et.melt(id_vars="Etapa", value_vars=["N Total", "P2O5", "K2O", "CaO", "MgO", "S Total"],
-                             var_name="Nutriente", value_name="kg lote")
-    st.plotly_chart(px.bar(df_plot, x="Nutriente", y="kg lote", color="Etapa", barmode="group"),
-                    width="stretch")
-
-# ==========================================
-# PESTAÑA 3: FERTILIZACIÓN SEMANAL
-# ==========================================
-with tab_dosis:
-    st.header("Arma tu fertilización semanal")
-    etapa = st.radio("Etapa", ETAPAS, horizontal=True, key="etapa_sel")
-    info = cfg["etapas"][etapa]
-    sem, fxs = max(int(info["semanas"]), 1), max(int(info["ferti_semana"]), 1)
     sol = requerimiento_etapa(cfg, req, etapa)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Duración", f"{sem} semanas")
-    c2.metric("Fertilizaciones / semana", fxs)
-    c3.metric("Plantas del lote", f"{d['plantas']:,}")
-    c4.metric("Total fertilizaciones", sem * fxs)
-    st.caption(f"Todas las dosis son para tus {d['plantas']:,} plantas (se cambian en la pestaña Diseño del Cultivo).")
-
-    # Dosis en memoria por etapa (para no perder lo escrito al agregar productos)
-    ss_key = f"dosis_mem_{etapa}"
-    if ss_key not in st.session_state:
-        guardadas = df_dosis[df_dosis["Etapa"] == etapa]
-        st.session_state[ss_key] = dict(zip(guardadas["Producto"], guardadas["Dosis_lote_semana"].astype(float)))
-    memoria = st.session_state[ss_key]
-
-    st.subheader("1. Elige tus fertilizantes")
-    elegidos = st.multiselect("Fertilizantes para esta etapa (escribe para buscar)",
-                              options=sorted(catalogo["Producto"].tolist()),
-                              default=[p for p in memoria if p in set(catalogo["Producto"])],
-                              key=f"sel_{etapa}", placeholder="Ej: Calcinit, Nitrato de potasio, MKP...")
-
-    st.subheader("2. Dosis por semana")
-    ver_key = f"ver_{etapa}"
-    st.session_state.setdefault(ver_key, 0)
-    fac = d["area_ha"] / sem   # kg/ha-etapa -> kg por semana para las plantas del lote
+    fac = d["area_ha"] / sem   # kg/ha-etapa -> kg por semana para las plantas
     req_sem = {"N_Total": (sol["N_NO3"] + sol["N_NH4"]) * fac, **{n: sol[n] * fac for n in REQ_NUT[1:]}}
-    with st.expander("🧮 Calcular dosis automáticamente con los fertilizantes elegidos", expanded=True):
-        st.caption("El programa busca la cantidad por semana de cada fertilizante que más se acerca al "
-                   "requerimiento semanal. Elige qué nutrientes quieres cubrir.")
-        nut_usar = st.multiselect("Nutrientes a cubrir", options=list(OPT_PESOS),
-                                  default=["N_Total", "P2O5", "K2O", "CaO", "MgO", "S"],
-                                  format_func=lambda n: ETIQUETA.get(n, n), key=f"nut_{etapa}")
-        if st.button("🧮 Calcular cuánto aplicar por semana", disabled=not elegidos, key=f"calc_{etapa}"):
-            sugeridas = calcular_dosis_automatica(elegidos, catalogo, req_sem, nut_usar)
-            st.session_state[ss_key] = sugeridas
-            memoria = sugeridas
-            st.session_state[ver_key] += 1
-            ceros = [p for p, v in sugeridas.items() if v == 0]
-            st.success("✅ Dosis calculadas. Puedes ajustarlas a mano en la tabla y luego guardar.")
-            if ceros:
-                st.info("Estos productos quedaron en 0 porque no ayudan a cubrir los nutrientes elegidos "
-                        "o los cubren mejor otros: " + ", ".join(ceros))
+
+    # ---------------- PASO 2 ----------------
+    st.markdown("### 2️⃣ Elige tus fertilizantes")
+    k_sel = f"sel_{etapa}"
+    if k_sel not in st.session_state:
+        previos = info.get("productos")
+        if previos is None:
+            previos = df_dosis[df_dosis["Etapa"] == etapa]["Producto"].tolist()
+        st.session_state[k_sel] = [p for p in previos if p in set(catalogo["Producto"])]
+    with st.container(border=True):
+        elegidos = st.multiselect("Escribe el nombre para buscarlo y tócalo para agregarlo",
+                                  options=sorted(catalogo["Producto"].tolist()), key=k_sel,
+                                  placeholder="Ej: Calcinit, MKP, Sulfato de magnesio…")
+        guardar_si_cambia(etapa, "productos", list(elegidos))
+        k_mic = f"micros_{etapa}"
+        if k_mic not in st.session_state:
+            st.session_state[k_mic] = bool(info.get("micros", False))
+        micros = st.toggle("Incluir también micronutrientes (hierro, zinc, boro…)", key=k_mic)
+        guardar_si_cambia(etapa, "micros", bool(micros))
+
+    nut_eval = MACROS + (MICROS if micros else [])
+
     if not elegidos:
-        st.info("👆 Elige uno o más fertilizantes para empezar.")
-        df_in = pd.DataFrame({"Producto": [], "Dosis_lote_semana": []})
-    else:
-        df_in = pd.DataFrame({"Producto": elegidos, "Dosis_lote_semana": [float(memoria.get(p, 0.0)) for p in elegidos]})
-    editado = st.data_editor(
-        df_in, hide_index=True, width="stretch", disabled=["Producto"],
-        key=f"ed_{etapa}_{st.session_state[ver_key]}_{abs(hash(tuple(elegidos)))}",
-        column_config={
-            "Producto": st.column_config.TextColumn("Fertilizante", width="large"),
-            "Dosis_lote_semana": st.column_config.NumberColumn(f"kg por semana para {d['plantas']:,} plantas",
-                                                               min_value=0.0, step=0.1, format="%.3f",
-                                                               help="Para líquidos: litros por semana"),
-        })
-    editado["Dosis_lote_semana"] = pd.to_numeric(editado["Dosis_lote_semana"], errors="coerce").fillna(0.0)
-    st.session_state[ss_key] = dict(zip(editado["Producto"], editado["Dosis_lote_semana"]))
+        st.info("👆 Elige al menos un fertilizante para ver cuánto aplicar.")
+        return
 
-    if st.button("💾 Guardar fertilización de esta etapa", type="primary"):
-        nuevo = editado.copy()
-        nuevo["Etapa"] = etapa
-        df_dosis = pd.concat([df_dosis[df_dosis["Etapa"] != etapa], nuevo[COLS_DOSIS]], ignore_index=True)
+    # Cálculo automático (o manual si la persona lo pide)
+    auto = dosis_auto_cache(tuple(elegidos), tuple(sorted(req_sem.items())), tuple(nut_eval), catalogo)
+    k_man = f"manual_{etapa}"
+    if k_man not in st.session_state:
+        st.session_state[k_man] = bool(info.get("modo_manual", False))
+    manual = st.toggle("✏️ Quiero poner yo mismo las cantidades", key=k_man,
+                       help="Si lo dejas apagado, la app calcula las cantidades sola")
+    guardar_si_cambia(etapa, "modo_manual", bool(manual))
+    if manual:
+        previas = info.get("dosis_manual", {})
+        df_man = pd.DataFrame({"Producto": elegidos,
+                               "kg_semana": [float(previas.get(p, auto.get(p, 0.0))) for p in elegidos]})
+        st.caption(f"Escribe los **kg por semana** para tus {num(d['plantas'], 0)} plantas (litros si es líquido).")
+        df_man = st.data_editor(df_man, hide_index=True, width="stretch", disabled=["Producto"],
+                                key=f"ed_man_{etapa}_{abs(hash(tuple(elegidos)))}",
+                                column_config={"Producto": st.column_config.TextColumn("Fertilizante"),
+                                               "kg_semana": st.column_config.NumberColumn("kg por semana", min_value=0.0,
+                                                                                          step=0.1, format="%.3f")})
+        dosis_final = {p: float(v or 0) for p, v in zip(df_man["Producto"], df_man["kg_semana"])}
+        guardar_si_cambia(etapa, "dosis_manual", dosis_final)
+    else:
+        dosis_final = {p: float(auto.get(p, 0.0)) for p in elegidos}
+
+    # guardar dosis usadas (para el resumen del ciclo)
+    actuales = df_dosis[df_dosis["Etapa"] == etapa]
+    if dict(zip(actuales["Producto"], actuales["Dosis_lote_semana"].round(6))) != {p: round(v, 6) for p, v in dosis_final.items()}:
+        df_dosis = pd.concat([df_dosis[df_dosis["Etapa"] != etapa],
+                              pd.DataFrame({"Etapa": etapa, "Producto": list(dosis_final),
+                                            "Dosis_lote_semana": list(dosis_final.values())})], ignore_index=True)
         guardar_dosis(df_dosis)
-        st.success("✅ Fertilización guardada")
 
-    res = calcular_dosis(editado, catalogo, d, sem, fxs)
-    tabla = tabla_cumplimiento(sol, res)
-    for c in ["Solicitado", "Calculado", "Diferencia"]:
-        tabla[c] = tabla[c] * fac
-    tabla["g/planta requerido"] = tabla["Solicitado"] * 1000 / d["plantas"]
-    tabla["g/planta aportado"] = tabla["Calculado"] * 1000 / d["plantas"]
-    tabla = tabla.rename(columns={"Solicitado": "Requerido kg/semana", "Calculado": "Aportado kg/semana",
-                                  "Diferencia": "Diferencia kg/semana"})
-    tabla = tabla[["Nutriente", "Requerido kg/semana", "Aportado kg/semana", "Cumplimiento_%", "Diferencia kg/semana",
-                   "g/planta requerido", "g/planta aportado"]]
+    df_uso = pd.DataFrame({"Producto": list(dosis_final), "Dosis_lote_semana": list(dosis_final.values())})
+    res = calcular_dosis(df_uso, catalogo, d, sem, fxs)
+    cat_i = catalogo.set_index("Producto")
 
-    st.subheader(f"3. ¿Cuánto cubres del requerimiento? (por semana, para {d['plantas']:,} plantas)")
-    col_t, col_g = st.columns([1, 1])
-    with col_t:
-        st.dataframe(tabla.style.format({"Requerido kg/semana": "{:,.3f}", "Aportado kg/semana": "{:,.3f}",
-                                         "Diferencia kg/semana": "{:+,.3f}", "Cumplimiento_%": "{:,.0f}%",
-                                         "g/planta requerido": "{:,.3f}", "g/planta aportado": "{:,.3f}"}, na_rep="-")
-                     .map(color_cumpl, subset=["Cumplimiento_%"]),
-                     hide_index=True, width="stretch", height=560)
-        st.caption("🟩 90–110%   🟨 75–125%   🟥 fuera de rango.  Diferencia negativa = lo que te falta por semana.")
-    with col_g:
-        tg = tabla.dropna(subset=["Cumplimiento_%"])
-        fig = go.Figure(go.Bar(x=tg["Nutriente"], y=tg["Cumplimiento_%"],
-                               marker_color=["#2e7d32" if 90 <= v <= 110 else "#f9a825" if 75 <= v <= 125 else "#c62828"
-                                             for v in tg["Cumplimiento_%"]]))
-        fig.add_hline(y=100, line_dash="dash")
-        fig.update_layout(yaxis_title="% cumplimiento", height=560, margin=dict(t=20))
-        st.plotly_chart(fig, width="stretch")
-
-    st.subheader("4. ¿Cuántas ppm aporta en el agua de riego?")
-    litros = st.number_input("Litros de agua por fertilización en el lote (L)", min_value=0.0,
-                             value=float(info.get("litros_ferti", 5000.0)), step=100.0, key=f"litros_{etapa}",
-                             help="Volumen total de agua en que se aplica UNA fertilización en el lote")
-    if litros != float(info.get("litros_ferti", 5000.0)):
-        cfg["etapas"][etapa]["litros_ferti"] = litros
-        guardar_config(cfg)
-    if res.empty or litros <= 0:
-        st.info("Escribe dosis y litros de agua para ver las ppm.")
-    else:
-        n_apl = sem * fxs
-        kg_ferti = {n: res[n].sum() * d["area_ha"] / n_apl for n in NUTRIENTES}  # kg nutriente por fertilización
-        kg_ferti["N_Total"] = kg_ferti["N_NO3"] + kg_ferti["N_NH4"]
-        req_ferti = {"N_Total": (sol["N_NO3"] + sol["N_NH4"]) * d["area_ha"] / n_apl,
-                     **{n: sol[n] * d["area_ha"] / n_apl for n in NUTRIENTES}}
-        filas = [{"Elemento": et, "ppm aportadas": ppm_de(kg_ferti[n] * f, litros),
-                  "ppm requeridas": ppm_de(req_ferti[n] * f, litros)} for et, n, f in PPM_FORMAS]
-        t_ppm = pd.DataFrame(filas)
-        g_l = res["Por_aplicacion_kg"].sum() * 1000 / litros
-        p1, p2 = st.columns([1, 1])
-        with p1:
-            st.dataframe(t_ppm.style.format({"ppm aportadas": "{:,.2f}", "ppm requeridas": "{:,.2f}"}),
-                         hide_index=True, width="stretch", height=560)
-        with p2:
-            st.metric("Concentración total de fertilizantes", f"{g_l:,.3f} g/L")
-            st.caption("ppm = mg por litro en el agua de riego durante la fertilización. "
-                       "P, K, Ca y Mg se expresan como elemento (no como óxido). "
-                       "NO3⁻ como ion sirve para comparar con la lectura del HORIBA en agua de riego.")
-            if g_l > 2:
-                st.warning("⚠️ Más de 2 g/L de fertilizantes: revisa la conductividad (CE) de la solución.")
-        with st.expander("Ver ppm que aporta cada fertilizante"):
-            filas = []
-            for _, r in res.iterrows():
-                fila = {"Producto": r["Producto"], "g/L": r["Por_aplicacion_kg"] * 1000 / litros}
-                kg = {n: r[n] * d["area_ha"] / n_apl for n in NUTRIENTES}
-                kg["N_Total"] = kg["N_NO3"] + kg["N_NH4"]
-                for et, n, f in PPM_FORMAS:
-                    fila[et] = ppm_de(kg[n] * f, litros)
-                filas.append(fila)
-            pp = pd.DataFrame(filas)
-            pp = pp.loc[:, (pp != 0).any(axis=0)]
-            st.dataframe(pp.style.format({c: "{:,.2f}" for c in pp.columns if c != "Producto"}),
-                         hide_index=True, width="stretch")
-
-    st.subheader("5. Programa semanal para el lote")
+    # ---------------- PASO 3 ----------------
+    st.markdown("### 3️⃣ Cuánto aplicar")
+    st.caption(f"Para tus **{num(d['plantas'], 0)} plantas** · {fxs} fertilizaciones por semana · etapa de {sem} semanas")
     if res.empty:
-        st.info("Escribe dosis mayores a cero para ver las cantidades a aplicar.")
+        st.warning("Con estos fertilizantes no se cubre ningún nutriente elegido. Prueba agregando otros.")
+    for _, r in res.iterrows():
+        liq = es_liquido(r["Producto"])
+        with st.container(border=True):
+            st.markdown(
+                f"**{r['Producto']}**  \n"
+                f"<span style='font-size:1.7rem;font-weight:700'>{cantidad(r['Por_aplicacion_kg'], liq)}</span>"
+                f" <span style='color:gray'>en cada fertilización</span>  \n"
+                f"<span style='color:gray'>{cantidad(r['Lote_semana_kg'], liq)} por semana · "
+                f"{num(r['G_planta_semana'], 2)} {'mL' if liq else 'g'} por planta a la semana</span>",
+                unsafe_allow_html=True)
+    ceros = [p for p in elegidos if dosis_final.get(p, 0) <= 0]
+    if ceros:
+        st.caption("No hace falta aplicar: " + ", ".join(ceros) +
+                   " (otros fertilizantes ya cubren lo que aportan).")
+
+    # ¿Cubre lo que necesita la planta?
+    st.markdown("#### ¿La planta recibe lo que necesita?")
+    aporte = {n: 0.0 for n in nut_eval}
+    for n in nut_eval:
+        if n == "N_Total":
+            aporte[n] = (res["N_NO3"].sum() + res["N_NH4"].sum()) * fac if not res.empty else 0.0
+        else:
+            aporte[n] = res[n].sum() * fac if not res.empty else 0.0
+    pcts = {n: (aporte[n] / req_sem[n] * 100 if req_sem.get(n) else None) for n in nut_eval}
+    with st.container(border=True):
+        lineas = []
+        for n in nut_eval:
+            ico, txt = estado(pcts[n])
+            lineas.append(f"{ico} **{NOMBRES[n]}** — {txt}" + (f" ({num(pcts[n], 0)}%)" if pcts[n] is not None else ""))
+        st.markdown("  \n".join(lineas))
+
+    faltan = [n for n in nut_eval if pcts[n] is not None and pcts[n] < 75]
+    sobran = [n for n in nut_eval if pcts[n] is not None and pcts[n] > 125]
+    for n in faltan:
+        cands = catalogo[~catalogo["Producto"].isin(elegidos)].copy()
+        cands["cont"] = cands.apply(lambda r: contenido(r, n), axis=1)
+        if n != "CaO":   # sugerir primero productos sin calcio, para no complicar los tanques
+            cands["cont"] = cands["cont"] - cands["CaO"] * 0.01
+        top = cands[cands["cont"] > 0].sort_values("cont", ascending=False).head(3)["Producto"].tolist()
+        with st.container(border=True):
+            st.markdown(f"💡 **Le falta {NOMBRES[n].split(' (')[0].lower()}.** Agrega uno de estos:")
+            if top:
+                bcols = st.columns(len(top))
+                for bc, p in zip(bcols, top):
+                    bc.button(f"➕ {p}", key=f"add_{etapa}_{n}_{p}", on_click=agregar_producto, args=(k_sel, p),
+                              width="stretch")
+            else:
+                st.caption("No hay en el catálogo un producto que lo aporte.")
+    if sobran:
+        st.info("🔺 Se pasa de " + ", ".join(NOMBRES[n].split(" (")[0].lower() for n in sobran) +
+                ". Suele pasar cuando un fertilizante trae varios nutrientes juntos. Prueba quitando ese "
+                "fertilizante o cambiándolo por otro.")
+
+    with st.expander("🔢 Ver el detalle en números"):
+        det = pd.DataFrame({"Nutriente": [NOMBRES[n] for n in nut_eval],
+                            "Necesita (kg/semana)": [req_sem[n] for n in nut_eval],
+                            "Recibe (kg/semana)": [aporte[n] for n in nut_eval],
+                            "%": [pcts[n] for n in nut_eval]})
+        st.dataframe(det.style.format({"Necesita (kg/semana)": "{:,.3f}", "Recibe (kg/semana)": "{:,.3f}",
+                                       "%": "{:,.0f}%"}, na_rep="-"), hide_index=True, width="stretch")
+
+    # ---------------- PASO 4 ----------------
+    st.markdown("### 4️⃣ Cómo preparar los tanques")
+    tq_txt = pd.DataFrame()
+    if res.empty:
+        st.info("Cuando haya cantidades a aplicar, aquí verás qué va en cada tanque.")
     else:
-        prog = res[["Producto", "Lote_semana_kg", "G_planta_semana", "Por_aplicacion_kg", "Cantidad_lote_kg"]].rename(columns={
-            "G_planta_semana": "g por planta por semana", "Lote_semana_kg": "Lote: kg por semana",
-            "Por_aplicacion_kg": f"Lote: kg por fertilización (÷{fxs})", "Cantidad_lote_kg": f"Lote: kg toda la etapa (×{sem} sem)"})
-        tot = prog.drop(columns="Producto").sum()
-        prog = pd.concat([prog, pd.DataFrame([{"Producto": "TOTAL", **tot}])], ignore_index=True)
-        st.dataframe(prog.style.format({c: "{:,.3f}" for c in prog.columns if c != "Producto"}),
-                     hide_index=True, width="stretch")
-        with st.expander("Ver aporte de nutrientes de cada fertilizante (kg por semana en el lote)"):
-            ap = res[["Producto"] + NUTRIENTES].copy()
-            ap[NUTRIENTES] = ap[NUTRIENTES] * fac
-            st.dataframe(ap.rename(columns=ETIQUETA).style.format({ETIQUETA.get(n, n): "{:,.3f}" for n in NUTRIENTES}),
+        with st.container(border=True):
+            t1, t2, t3 = st.columns(3)
+            k_base = f"tq_base_{etapa}"
+            base_tq = t1.radio("Preparo los tanques para:", ["Cada fertilización", "Toda la semana"], key=k_base)
+            k_va, k_vb = f"vol_a_{etapa}", f"vol_b_{etapa}"
+            st.session_state.setdefault(k_va, float(info.get("vol_a", 200.0)))
+            st.session_state.setdefault(k_vb, float(info.get("vol_b", 200.0)))
+            vol_a = t2.number_input("Litros del tanque A", min_value=1.0, step=10.0, format="%.0f", key=k_va)
+            vol_b = t3.number_input("Litros del tanque B", min_value=1.0, step=10.0, format="%.0f", key=k_vb)
+            guardar_si_cambia(etapa, "vol_a", float(vol_a))
+            guardar_si_cambia(etapa, "vol_b", float(vol_b))
+
+        col_kg = "Por_aplicacion_kg" if base_tq == "Cada fertilización" else "Lote_semana_kg"
+        tq = res[["Producto", col_kg]].rename(columns={col_kg: "kg"}).reset_index(drop=True)
+        props = [proponer_tanque(cat_i.loc[p]) for p in tq["Producto"]]
+        tq["Tanque"] = [t for t, _ in props]
+        tq["Motivo"] = [m for _, m in props]
+        carga = {"A": tq.loc[tq["Tanque"] == "A", "kg"].sum(), "B": tq.loc[tq["Tanque"] == "B", "kg"].sum()}
+        for i_, r in tq[tq["Tanque"] == "A/B"].sort_values("kg", ascending=False).iterrows():
+            destino = "A" if carga["A"] <= carga["B"] else "B"
+            tq.at[i_, "Tanque"] = destino
+            carga[destino] += r["kg"]
+        cambios = dict(info.get("tanques", {}))
+        tq["Tanque"] = [cambios.get(p_, t_) for p_, t_ in zip(tq["Producto"], tq["Tanque"])]
+
+        ca_, cb_ = st.columns(2)
+        for col_, t_, vol, color in [(ca_, "A", vol_a, "🟦"), (cb_, "B", vol_b, "🟧")]:
+            sub = tq[tq["Tanque"] == t_]
+            with col_.container(border=True):
+                st.markdown(f"#### {color} Tanque {t_}")
+                st.caption(f"{num(vol, 0)} litros de agua")
+                if sub.empty:
+                    st.write("— Vacío —")
+                    continue
+                for _, r in sub.iterrows():
+                    st.markdown(f"- **{cantidad(r['kg'], es_liquido(r['Producto']))}** de {r['Producto']}")
+                conc = sub["kg"].sum() * 1000 / vol
+                if conc > 250:
+                    st.warning(f"Muy concentrado ({num(conc, 0)} g por litro): puede no disolverse. "
+                               "Usa más agua o prepáralo para cada fertilización.")
+
+        comp_tq = {t_: tq.loc[tq["Tanque"] == t_, "Producto"].tolist() for t_ in "AB"}
+        problema = False
+        for t_ in "AB":
+            con_ca = [p_ for p_ in comp_tq[t_] if cat_i.at[p_, "CaO"] >= 1]
+            con_ps = [p_ for p_ in comp_tq[t_] if cat_i.at[p_, "P2O5"] >= 1 or cat_i.at[p_, "S"] >= 1]
+            if [x for x in con_ca if x not in con_ps] and [x for x in con_ps if x not in con_ca]:
+                problema = True
+                st.error(f"❌ En el tanque {t_} hay calcio junto con fosfatos o sulfatos. Se forma una piedra "
+                         "que tapa los goteros. Cámbialos de tanque abajo.")
+            for x in [x for x in con_ca if x in con_ps]:
+                st.warning(f"⚠️ {x} trae calcio y fosfato/sulfato juntos. Revisa la etiqueta o aplícalo aparte.")
+        if not problema:
+            st.success("✅ La mezcla está bien: el calcio (tanque A) no se junta con fosfatos ni sulfatos (tanque B).")
+
+        with st.expander("🔄 Cambiar un fertilizante de tanque"):
+            st.caption("La app ya los separó. Cámbialos solo si sabes lo que haces.")
+            for _, r in tq.iterrows():
+                cc1, cc2 = st.columns([3, 1])
+                cc1.markdown(f"{r['Producto']}  \n<small>{r['Motivo']}</small>", unsafe_allow_html=True)
+                nuevo = cc2.radio("Tanque", ["A", "B"], index=0 if r["Tanque"] == "A" else 1, horizontal=True,
+                                  key=f"mv_{etapa}_{r['Producto']}", label_visibility="collapsed")
+                if nuevo != r["Tanque"]:
+                    cambios[r["Producto"]] = nuevo
+                    guardar_si_cambia(etapa, "tanques", cambios)
+                    st.rerun()
+            if cambios and st.button("↩️ Volver a la propuesta de la app", key=f"reset_tq_{etapa}"):
+                guardar_si_cambia(etapa, "tanques", {})
+                for k in [k for k in st.session_state if k.startswith(f"mv_{etapa}_")]:
+                    del st.session_state[k]
+                st.rerun()
+        st.caption("👉 Llena 2/3 del tanque con agua, disuelve un producto a la vez revolviendo y completa con agua.")
+        tq_txt = tq
+
+    # ---------------- PPM (opcional) ----------------
+    with st.expander("💧 Ver ppm en el agua de riego (para comparar con el HORIBA)"):
+        k_l = f"litros_{etapa}"
+        st.session_state.setdefault(k_l, float(info.get("litros_ferti", 5000.0)))
+        litros = st.number_input("¿Cuántos litros de agua lleva una fertilización en todo el lote?",
+                                 min_value=1.0, step=100.0, format="%.0f", key=k_l)
+        guardar_si_cambia(etapa, "litros_ferti", float(litros))
+        if not res.empty:
+            n_apl = sem * fxs
+            kg_f = {n: res[n].sum() * d["area_ha"] / n_apl for n in NUTRIENTES}
+            kg_f["N_Total"] = kg_f["N_NO3"] + kg_f["N_NH4"]
+            rq_f = {"N_Total": (sol["N_NO3"] + sol["N_NH4"]) * d["area_ha"] / n_apl,
+                    **{n: sol[n] * d["area_ha"] / n_apl for n in NUTRIENTES}}
+            t_ppm = pd.DataFrame([{"Elemento": et, "ppm que pones": ppm_de(kg_f[n] * f, litros),
+                                   "ppm que necesita": ppm_de(rq_f[n] * f, litros)} for et, n, f in PPM_FORMAS])
+            st.dataframe(t_ppm.style.format({"ppm que pones": "{:,.1f}", "ppm que necesita": "{:,.1f}"}),
                          hide_index=True, width="stretch")
+            st.caption("ppm = miligramos por litro. NO3⁻ (ion) es el valor que se compara con el HORIBA.")
+
+    # ---------------- DESCARGA ----------------
+    receta = res[["Producto", "Por_aplicacion_kg", "Lote_semana_kg", "G_planta_semana", "Cantidad_lote_kg"]].rename(columns={
+        "Por_aplicacion_kg": "kg en cada fertilización", "Lote_semana_kg": "kg por semana",
+        "G_planta_semana": "g por planta por semana", "Cantidad_lote_kg": "kg toda la etapa"})
+    if not tq_txt.empty:
+        receta = receta.merge(tq_txt[["Producto", "Tanque"]], on="Producto", how="left")
+    estado_df = pd.DataFrame({"Nutriente": [NOMBRES[n] for n in nut_eval],
+                              "Estado": [estado(pcts[n])[1] for n in nut_eval],
+                              "% cubierto": [round(pcts[n] or 0) for n in nut_eval]})
+    datos_df = pd.DataFrame({"Dato": ["Etapa", "Plantas", "Fertilizaciones por semana", "Semanas de la etapa", "Fecha"],
+                             "Valor": [etapa, d["plantas"], fxs, sem, f"{datetime.now():%Y-%m-%d}"]})
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        datos_df.to_excel(w, index=False, sheet_name="Receta", startrow=0)
+        receta.to_excel(w, index=False, sheet_name="Receta", startrow=len(datos_df) + 2)
+        estado_df.to_excel(w, index=False, sheet_name="Nutrientes")
+    st.download_button("📥 Descargar la receta (Excel)", data=buf.getvalue(), type="primary", width="stretch",
+                       file_name=f"receta_{etapa.split(' - ')[1].lower()}_{datetime.now():%Y%m%d}.xlsx")
+
+
+with tab_main:
+    _principal()
+
+d = diseno(cfg)
+req = requerimiento_ciclo(cfg, d)
 
 # ==========================================
-# PESTAÑA 4: RESUMEN DEL CICLO
+# PESTAÑA RESUMEN Y COPIA
 # ==========================================
 with tab_res:
     st.header("Resumen del ciclo")
@@ -675,20 +768,142 @@ with tab_res:
         st.download_button("📥 Descargar programa en Excel", data=output.getvalue(),
                            file_name=f"programa_tomate_{datetime.now():%Y%m%d}.xlsx")
 
+    st.markdown("---")
+    st.subheader("💾 Copia de seguridad")
+    st.caption("Si la app se reinicia en internet puede perder lo que guardaste. Descarga una copia de vez en "
+               "cuando y súbela si ves que se borró.")
+    copia = json.dumps({"config": cfg, "dosis": df_dosis.to_dict(orient="records")}, ensure_ascii=False, indent=1)
+    st.download_button("📥 Descargar copia", data=copia.encode("utf-8"),
+                       file_name=f"copia_fertilizacion_tomate_{datetime.now():%Y%m%d}.json", mime="application/json")
+    subido = st.file_uploader("Subir una copia guardada", type="json")
+    if subido is not None and st.button("♻️ Recuperar esta copia"):
+        try:
+            datos = json.load(subido)
+            guardar_config(datos["config"])
+            guardar_dosis(pd.DataFrame(datos["dosis"], columns=COLS_DOSIS))
+            st.session_state.clear()
+            st.success("✅ Copia recuperada")
+            st.rerun()
+        except Exception:
+            st.error("Ese archivo no es una copia válida de esta app.")
+
 # ==========================================
-# PESTAÑA 5: CATÁLOGO
+# PESTAÑA CONFIGURACIÓN AVANZADA
 # ==========================================
-with tab_cat:
-    st.header("Catálogo de fertilizantes")
-    st.write("✏️ Composición en % (N y formas como N; P como P2O5; K como K2O; Ca como CaO; Mg como MgO; "
-             "S y menores como elemento). Para líquidos, el % ya está convertido a kg por litro aplicado.")
-    filtro = st.text_input("🔎 Buscar producto")
-    vista = catalogo[catalogo["Producto"].str.contains(filtro, case=False, na=False)] if filtro else catalogo
-    cat_ed = st.data_editor(vista, num_rows="dynamic", width="stretch", hide_index=True, key="ed_cat")
-    if st.button("💾 Guardar catálogo"):
-        resto = catalogo[~catalogo.index.isin(vista.index)]
-        nuevo = pd.concat([resto, cat_ed], ignore_index=True).dropna(subset=["Producto"])
-        nuevo = nuevo.drop_duplicates(subset="Producto", keep="last").sort_values("Producto")
-        nuevo.to_csv(CATALOGO_FILE, index=False)
-        st.success("✅ Catálogo actualizado")
-        st.rerun()
+with tab_adv:
+    st.info("🔧 Esta parte es para el técnico. Si solo vas a fertilizar, no necesitas tocar nada aquí.")
+    sub_dis, sub_etp, sub_cat = st.tabs(["Diseño y extracción", "Reparto por etapas", "Catálogo de fertilizantes"])
+    with sub_dis:
+        st.header("Diseño agronómico")
+        with st.form("form_diseno"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                dist_surcos = st.number_input("Distancia entre surcos / caminos (m)", 0.1, 5.0, float(cfg["dist_surcos"]), 0.05)
+                dist_plantas = st.number_input("Espaciamiento entre plantas (m)", 0.05, 3.0, float(cfg["dist_plantas"]), 0.01)
+                plantas = st.number_input("Plantas sembradas en el lote", 1, 10_000_000, int(cfg["plantas_sembradas"]), 100)
+            with c2:
+                prod_std = st.number_input("Producción estándar (kg/planta)", 0.1, 30.0, float(cfg["prod_estandar"]), 0.5)
+                prod_obj = st.number_input("Producción objetivo (kg/planta)", 0.1, 30.0, float(cfg["prod_objetivo"]), 0.5)
+                fc = st.number_input("Factor de corrección (F.C.)", 0.1, 3.0, float(cfg["factor_correccion"]), 0.05)
+            with c3:
+                base = st.radio("Calcular requerimiento con:", ["Producción estándar", "Producción objetivo"],
+                                index=0 if cfg["base_requerimiento"] == "Producción estándar" else 1)
+                frac_no3 = st.slider("Fracción del N como nitrato (NO3)", 0.0, 1.0, float(cfg["frac_no3"]), 0.05)
+
+            st.markdown("**Extracción (kg por tonelada producida) y % de aporte a suplir con fertilizante**")
+            df_ext = pd.DataFrame({
+                "Nutriente": [ETIQUETA.get(n, n) for n in REQ_NUT],
+                "Extraccion_kg_ton": [cfg["extraccion"][n] for n in REQ_NUT],
+                "Factor_suelo": [cfg["aporte_suelo"][n] for n in REQ_NUT],
+            })
+            df_ext_ed = st.data_editor(df_ext, hide_index=True, width="stretch", disabled=["Nutriente"],
+                                       key="ed_ext",
+                                       column_config={"Factor_suelo": st.column_config.NumberColumn(
+                                           "Factor suelo (1 = 100%)", help="Reduce si el análisis de suelo aporta parte del nutriente")})
+            guardar = st.form_submit_button("💾 Guardar diseño")
+        if guardar:
+            cfg.update({"dist_surcos": dist_surcos, "dist_plantas": dist_plantas, "plantas_sembradas": int(plantas),
+                        "prod_estandar": prod_std, "prod_objetivo": prod_obj, "factor_correccion": fc,
+                        "base_requerimiento": base, "frac_no3": frac_no3})
+            cfg["extraccion"] = dict(zip(REQ_NUT, df_ext_ed["Extraccion_kg_ton"].astype(float)))
+            cfg["aporte_suelo"] = dict(zip(REQ_NUT, df_ext_ed["Factor_suelo"].astype(float)))
+            guardar_config(cfg)
+            for k in ["plantas_main", "prod_main"]:
+                st.session_state.pop(k, None)
+            st.success("✅ Diseño guardado")
+            st.rerun()
+
+        st.markdown("---")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Densidad de siembra", f"{d['densidad']:,.0f} pl/ha")
+        m2.metric("Área del lote", f"{d['area_ha']:.3f} ha")
+        m3.metric("Prod. estándar", f"{d['ton_std']:,.1f} t/ha")
+        m4.metric("Prod. objetivo", f"{d['ton_obj']:,.1f} t/ha")
+
+        st.subheader(f"Requerimiento del ciclo (kg/ha) — base: {cfg['base_requerimiento'].lower()}")
+        df_req = pd.DataFrame({"Nutriente": [ETIQUETA.get(n, n) for n in REQ_NUT],
+                               "kg/ha-ciclo": [req[n] for n in REQ_NUT],
+                               "kg en el lote": [req[n] * d["area_ha"] for n in REQ_NUT],
+                               "g por planta-ciclo": [req[n] * d["area_ha"] * 1000 / d["plantas"] for n in REQ_NUT]})
+        st.dataframe(df_req.style.format({"kg/ha-ciclo": "{:,.3f}", "kg en el lote": "{:,.3f}", "g por planta-ciclo": "{:,.3f}"}),
+                     hide_index=True, width="stretch")
+    with sub_etp:
+        st.header("Distribución del requerimiento por etapa fenológica")
+        st.write("✏️ Edita el % de cada nutriente por etapa, las semanas y las fertilizaciones por semana. Cada columna debería sumar 100%.")
+        filas = []
+        for e in ETAPAS:
+            fila = {"Etapa": e, "Semanas": cfg["etapas"][e]["semanas"], "Ferti/semana": cfg["etapas"][e]["ferti_semana"]}
+            fila.update({ETIQUETA.get(n, n): cfg["etapas"][e]["pct"][n] for n in REQ_NUT})
+            filas.append(fila)
+        df_pct = pd.DataFrame(filas)
+        df_pct_ed = st.data_editor(df_pct, hide_index=True, width="stretch", disabled=["Etapa"], key="ed_pct")
+
+        sumas = {ETIQUETA.get(n, n): df_pct_ed[ETIQUETA.get(n, n)].sum() for n in REQ_NUT}
+        malas = {k: v for k, v in sumas.items() if abs(v - 100) > 0.01}
+        if malas:
+            st.warning("⚠️ Estos nutrientes no suman 100% entre las 3 etapas: " +
+                       ", ".join(f"{k} = {v:g}%" for k, v in malas.items()))
+        if st.button("💾 Guardar distribución por etapas"):
+            for _, r in df_pct_ed.iterrows():
+                e = r["Etapa"]
+                cfg["etapas"][e]["semanas"] = int(r["Semanas"])
+                cfg["etapas"][e]["ferti_semana"] = int(r["Ferti/semana"])
+                cfg["etapas"][e]["pct"] = {n: float(r[ETIQUETA.get(n, n)]) for n in REQ_NUT}
+            guardar_config(cfg)
+            for k in [k for k in st.session_state if k.startswith("fxs_")]:
+                del st.session_state[k]
+            st.success("✅ Distribución guardada")
+            st.rerun()
+
+        total_sem = sum(cfg["etapas"][e]["semanas"] for e in ETAPAS)
+        st.caption(f"Duración total de las etapas: {total_sem} semanas ({total_sem * 7} días)")
+
+        st.subheader(f"Requerimiento por etapa (kg para {d['plantas']:,} plantas)")
+        filas = []
+        for e in ETAPAS:
+            r = requerimiento_etapa(cfg, req, e)
+            a = d["area_ha"]
+            fila = {"Etapa": e, "N Total": (r["N_NO3"] + r["N_NH4"]) * a}
+            fila.update({ETIQUETA.get(n, n): r[n] * a for n in NUTRIENTES})
+            filas.append(fila)
+        df_req_et = pd.DataFrame(filas)
+        st.dataframe(df_req_et.style.format({c: "{:,.3f}" for c in df_req_et.columns if c != "Etapa"}),
+                     hide_index=True, width="stretch")
+        df_plot = df_req_et.melt(id_vars="Etapa", value_vars=["N Total", "P2O5", "K2O", "CaO", "MgO", "S Total"],
+                                 var_name="Nutriente", value_name="kg lote")
+        st.plotly_chart(px.bar(df_plot, x="Nutriente", y="kg lote", color="Etapa", barmode="group"),
+                        width="stretch")
+    with sub_cat:
+        st.header("Catálogo de fertilizantes")
+        st.write("✏️ Composición en % (N y formas como N; P como P2O5; K como K2O; Ca como CaO; Mg como MgO; "
+                 "S y menores como elemento). Para líquidos, el % ya está convertido a kg por litro aplicado.")
+        filtro = st.text_input("🔎 Buscar producto")
+        vista = catalogo[catalogo["Producto"].str.contains(filtro, case=False, na=False)] if filtro else catalogo
+        cat_ed = st.data_editor(vista, num_rows="dynamic", width="stretch", hide_index=True, key="ed_cat")
+        if st.button("💾 Guardar catálogo"):
+            resto = catalogo[~catalogo.index.isin(vista.index)]
+            nuevo = pd.concat([resto, cat_ed], ignore_index=True).dropna(subset=["Producto"])
+            nuevo = nuevo.drop_duplicates(subset="Producto", keep="last").sort_values("Producto")
+            nuevo.to_csv(CATALOGO_FILE, index=False)
+            st.success("✅ Catálogo actualizado")
+            st.rerun()
