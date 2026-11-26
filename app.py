@@ -26,8 +26,8 @@ ETAPAS = ["Etapa 1 - Vegetativo", "Etapa 2 - Desarrollo", "Etapa 3 - Llenado"]
 CONFIG_BASE = {
     "dist_surcos": 1.2,
     "dist_plantas": 0.3,
-    "plantas_sembradas": 4000,
-    "prod_estandar": 5.0,
+    "plantas_sembradas": 10000,
+    "prod_estandar": 8.0,
     "prod_objetivo": 8.0,
     "factor_correccion": 1.0,
     "base_requerimiento": "Producción estándar",
@@ -42,8 +42,8 @@ CONFIG_BASE = {
         "Etapa 2 - Desarrollo": {"semanas": 5, "ferti_semana": 5,
             "pct": {"N_Total": 40, "P2O5": 32, "K2O": 32, "CaO": 40, "MgO": 40, "S": 32, "Fe": 30, "Mn": 30,
                     "Zn": 30, "B": 30, "Cu": 30, "Mo": 30, "Co": 30}},
-        "Etapa 3 - Llenado": {"semanas": 12, "ferti_semana": 5,
-            "pct": {"N_Total": 30, "P2O5": 30, "K2O": 45, "CaO": 30, "MgO": 40, "S": 30, "Fe": 45, "Mn": 45,
+        "Etapa 3 - Llenado": {"semanas": 5, "ferti_semana": 5,
+            "pct": {"N_Total": 30, "P2O5": 30, "K2O": 45, "CaO": 30, "MgO": 30, "S": 30, "Fe": 45, "Mn": 45,
                     "Zn": 45, "B": 45, "Cu": 45, "Mo": 45, "Co": 45}},
     },
 }
@@ -158,6 +158,22 @@ def cargar_config():
             cfg = json.load(f)
         for k, v in CONFIG_BASE.items():
             cfg.setdefault(k, v)
+        # Actualización nov-2026: datos actuales del Excel y MgO que sumaba 110 %
+        if cfg.get("version_datos", 1) < 2:
+            if cfg.get("prod_estandar") == 5.0 and cfg.get("plantas_sembradas") == 4000:
+                cfg["prod_estandar"], cfg["plantas_sembradas"] = 8.0, 10000
+            pct3 = cfg["etapas"]["Etapa 3 - Llenado"]["pct"]
+            suma_mg = sum(cfg["etapas"][e]["pct"]["MgO"] for e in ETAPAS)
+            if abs(suma_mg - 110) < 0.01 and pct3["MgO"] == 40:
+                pct3["MgO"] = 30
+            cfg["version_datos"] = 2
+            guardar_config(cfg)
+        # Actualización: llenado con 5 semanas, igual que el Excel
+        if cfg.get("version_datos", 1) < 3:
+            if cfg["etapas"]["Etapa 3 - Llenado"]["semanas"] == 12:
+                cfg["etapas"]["Etapa 3 - Llenado"]["semanas"] = 5
+            cfg["version_datos"] = 3
+            guardar_config(cfg)
         return cfg
     return json.loads(json.dumps(CONFIG_BASE))
 
