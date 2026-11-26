@@ -248,12 +248,19 @@ OPT_PESOS = {"N_Total": 1.0, "P2O5": 1.0, "K2O": 1.0, "CaO": 1.0, "MgO": 1.0, "S
              "Fe": 0.4, "Mn": 0.4, "Zn": 0.4, "B": 0.4, "Cu": 0.4, "Mo": 0.2}
 
 
-def calcular_dosis_automatica(productos, catalogo, req_semana, nutrientes_usar, iteraciones=4000):
+def calcular_dosis_automatica(productos, catalogo, req_semana, nutrientes_usar, iteraciones=4000, fijos=None):
     """Mínimos cuadrados no negativos sobre el error RELATIVO de cada nutriente.
+    Los productos en `fijos` quedan con la cantidad que puso la persona y el resto se recalcula.
     Devuelve kg por semana (en las mismas unidades del requerimiento) de cada producto."""
     import numpy as np
+    fijos = {p: v for p, v in (fijos or {}).items() if p in productos}
+    libres = [p for p in productos if p not in fijos]
+    if not libres:
+        return {p: round(float(fijos[p]), 3) for p in productos}
+    todos = list(productos)
+    productos = libres
     cat = catalogo.set_index("Producto")
-    filas, pesos, metas = [], [], []
+    filas, pesos, metas, aportado_fijo = [], [], [], []
     for n in nutrientes_usar:
         meta = req_semana.get(n, 0.0)
         if meta <= 0:
@@ -262,12 +269,16 @@ def calcular_dosis_automatica(productos, catalogo, req_semana, nutrientes_usar, 
             fila = [(cat.at[p, "N_NO3"] + cat.at[p, "N_NH4"]) / 100 for p in productos]
         else:
             fila = [cat.at[p, n] / 100 for p in productos]
-        filas.append(fila); pesos.append(OPT_PESOS.get(n, 0.5)); metas.append(meta)
+        if n == "N_Total":
+            ya = sum((cat.at[q, "N_NO3"] + cat.at[q, "N_NH4"]) / 100 * v for q, v in fijos.items())
+        else:
+            ya = sum(cat.at[q, n] / 100 * v for q, v in fijos.items())
+        filas.append(fila); pesos.append(OPT_PESOS.get(n, 0.5)); metas.append(meta); aportado_fijo.append(ya)
     if not filas:
-        return {p: 0.0 for p in productos}
+        return {**{p: 0.0 for p in productos}, **fijos}
     A = np.array(filas, dtype=float); b = np.array(metas, dtype=float); w = np.array(pesos, dtype=float)
     Aw = A / b[:, None] * w[:, None]   # error relativo ponderado
-    bw = w.copy()
+    bw = w * (1 - np.array(aportado_fijo) / b)   # lo que falta después de los productos fijados
     H = Aw.T @ Aw; g0 = Aw.T @ bw
     x = np.zeros(len(productos))
     diag = np.diag(H).copy()
@@ -280,7 +291,9 @@ def calcular_dosis_automatica(productos, catalogo, req_semana, nutrientes_usar, 
             cambio = max(cambio, abs(nuevo - x[j])); x[j] = nuevo
         if cambio < 1e-9:
             break
-    return {p: round(float(v), 3) for p, v in zip(productos, x)}
+    salida = {p: round(float(v), 3) for p, v in zip(productos, x)}
+    salida.update({p: round(float(v), 3) for p, v in fijos.items()})
+    return {p: salida.get(p, 0.0) for p in todos}
 
 
 def proponer_tanque(fila):
@@ -392,8 +405,31 @@ def contenido(cat_row, n):
 
 
 @st.cache_data(show_spinner=False)
-def dosis_auto_cache(productos, req_items, nutrientes, catalogo_df):
-    return calcular_dosis_automatica(list(productos), catalogo_df, dict(req_items), list(nutrientes))
+def dosis_auto_cache(productos, req_items, nutrientes, catalogo_df, fijos_items=()):
+    return calcular_dosis_automatica(list(productos), catalogo_df, dict(req_items), list(nutrientes),
+                                     fijos=dict(fijos_items))
+
+
+def fijar_dosis(e, prod, key):
+    f = dict(cfg["etapas"][e].get("fijos", {}))
+    f[prod] = float(st.session_state[key])
+    cfg["etapas"][e]["fijos"] = f
+    guardar_config(cfg)
+
+
+def liberar_dosis(e, prod, key):
+    f = dict(cfg["etapas"][e].get("fijos", {}))
+    f.pop(prod, None)
+    cfg["etapas"][e]["fijos"] = f
+    guardar_config(cfg)
+    st.session_state.pop(key, None)
+
+
+def liberar_todas(e):
+    cfg["etapas"][e]["fijos"] = {}
+    guardar_config(cfg)
+    for k in [k for k in st.session_state if k.startswith(f"dose_{e}_")]:
+        del st.session_state[k]
 
 
 DIAS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
@@ -535,28 +571,11 @@ def _principal():
         st.info("👆 Elige al menos un fertilizante para ver cuánto aplicar.")
         return
 
-    # Cálculo automático (o manual si la persona lo pide)
-    auto = dosis_auto_cache(tuple(elegidos), tuple(sorted(req_sem.items())), tuple(nut_eval), catalogo)
-    k_man = f"manual_{etapa}"
-    if k_man not in st.session_state:
-        st.session_state[k_man] = bool(info.get("modo_manual", False))
-    manual = st.toggle("✏️ Quiero poner yo mismo las cantidades", key=k_man,
-                       help="Si lo dejas apagado, la app calcula las cantidades sola")
-    guardar_si_cambia(etapa, "modo_manual", bool(manual))
-    if manual:
-        previas = info.get("dosis_manual", {})
-        df_man = pd.DataFrame({"Producto": elegidos,
-                               "kg_semana": [float(previas.get(p, auto.get(p, 0.0))) for p in elegidos]})
-        st.caption(f"Escribe los **kg por semana** para tus {num(d['plantas'], 0)} plantas (litros si es líquido).")
-        df_man = st.data_editor(df_man, hide_index=True, width="stretch", disabled=["Producto"],
-                                key=f"ed_man_{etapa}_{abs(hash(tuple(elegidos)))}",
-                                column_config={"Producto": st.column_config.TextColumn("Fertilizante"),
-                                               "kg_semana": st.column_config.NumberColumn("kg por semana", min_value=0.0,
-                                                                                          step=0.1, format="%.3f")})
-        dosis_final = {p: float(v or 0) for p, v in zip(df_man["Producto"], df_man["kg_semana"])}
-        guardar_si_cambia(etapa, "dosis_manual", dosis_final)
-    else:
-        dosis_final = {p: float(auto.get(p, 0.0)) for p in elegidos}
+    # Cálculo automático, respetando los productos que la persona fijó
+    fijos = {p: float(v) for p, v in info.get("fijos", {}).items() if p in elegidos}
+    dosis_final = dosis_auto_cache(tuple(elegidos), tuple(sorted(req_sem.items())), tuple(nut_eval), catalogo,
+                                   tuple(sorted(fijos.items())))
+    dosis_final = {p: float(dosis_final.get(p, 0.0)) for p in elegidos}
 
     # guardar dosis usadas (para el resumen del ciclo)
     actuales = df_dosis[df_dosis["Etapa"] == etapa]
@@ -574,21 +593,30 @@ def _principal():
     st.markdown("### 3️⃣ Cuánto aplicar en la semana")
     st.caption(f"Cantidades para **todas tus {num(d['plantas'], 0)} plantas juntas**, en una semana. "
                f"En el paso 4 está cómo repartirlo día por día.")
-    if res.empty:
-        st.warning("Con estos fertilizantes no se cubre ningún nutriente elegido. Prueba agregando otros.")
-    for _, r in res.iterrows():
-        liq = es_liquido(r["Producto"])
+    st.info("✋ ¿Quieres más de un producto y menos de otro? Súbele o bájale con **−** y **+**. "
+            "La app ajusta los demás para que la planta siga recibiendo lo que necesita.")
+    for p in elegidos:
+        liq = es_liquido(p)
+        fijo = p in fijos
+        k = f"dose_{etapa}_{p}"
+        if not fijo or k not in st.session_state:
+            st.session_state[k] = round(float(dosis_final[p]), 2)
         with st.container(border=True):
-            st.markdown(
-                f"**{r['Producto']}**  \n"
-                f"<span style='font-size:1.7rem;font-weight:700'>{cantidad(r['Lote_semana_kg'], liq)}</span>"
-                f" <span style='color:gray'>por semana (todo el lote)</span>  \n"
-                f"<span style='color:gray'>{num(r['G_planta_semana'], 2)} {'mL' if liq else 'g'} por planta a la semana</span>",
-                unsafe_allow_html=True)
-    ceros = [p for p in elegidos if dosis_final.get(p, 0) <= 0]
-    if ceros:
-        st.caption("No hace falta aplicar: " + ", ".join(ceros) +
-                   " (otros fertilizantes ya cubren lo que aportan).")
+            st.markdown(f"**{p}**  \n" + ("<span style='color:#b26a00'>🔒 Cantidad puesta por ti</span>" if fijo
+                                          else "<span style='color:gray'>🤖 Calculado por la app</span>"),
+                        unsafe_allow_html=True)
+            st.number_input(f"{'Litros' if liq else 'kg'} por semana (todo el lote)", min_value=0.0, step=0.1,
+                            format="%.2f", key=k, on_change=fijar_dosis, args=(etapa, p, k))
+            g_pl = dosis_final[p] * 1000 / max(d["plantas"], 1)
+            if dosis_final[p] > 0:
+                st.caption(f"= {num(g_pl, 2)} {'mL' if liq else 'g'} por planta a la semana")
+            else:
+                st.caption("La app no lo necesita con esta mezcla. Súbele si de todas formas quieres aplicarlo.")
+            if fijo:
+                st.button("↩️ Que lo calcule la app", key=f"lib_{etapa}_{p}", on_click=liberar_dosis,
+                          args=(etapa, p, k))
+    if len(fijos) > 1:
+        st.button("↩️ Volver todo a automático", on_click=liberar_todas, args=(etapa,), key=f"lib_all_{etapa}")
 
     # ¿Cubre lo que necesita la planta?
     st.markdown("#### ¿La planta recibe lo que necesita?")
